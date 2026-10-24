@@ -303,7 +303,7 @@ jobs:
   build-linux:
     needs: release-config
     name: Build (Linux)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       # CI 无 FUSE，AppImage 工具链需解包运行
