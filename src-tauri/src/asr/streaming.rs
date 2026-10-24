@@ -88,11 +88,55 @@ pub fn discover_model_files(dir: &Path) -> Result<ModelFiles, AsrError> {
 pub struct StreamingAdapter {
     recognizer: Option<OnlineRecognizer>,
     stream: Option<OnlineStream>,
-    builder: SegmentBuilder,
-    utterance: i64,
+    utterance: UtteranceState,
     samples_fed: u64,
-    utterance_start_ms: u64,
     flushed: bool,
+}
+
+#[derive(Default)]
+struct UtteranceState {
+    builder: SegmentBuilder,
+    index: i64,
+    start_ms: u64,
+    text: Option<String>,
+    updated: bool,
+}
+
+impl UtteranceState {
+    fn observe(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.text = Some(crate::asr::latin_case::restore_sentence_case(text));
+            self.updated = true;
+        }
+    }
+
+    fn partial(&mut self, end_ms: u64) -> Option<TranscriptSegment> {
+        if !std::mem::take(&mut self.updated) {
+            return None;
+        }
+        let text = self.text.as_deref()?;
+        Some(
+            self.builder
+                .build(self.index, text, self.start_ms, end_ms, false),
+        )
+    }
+
+    fn finish(&mut self, end_ms: u64) -> Option<TranscriptSegment> {
+        self.updated = false;
+        let text = self.text.take()?;
+        let segment = self
+            .builder
+            .build(self.index, &text, self.start_ms, end_ms, true);
+        self.builder.forget(self.index);
+        Some(segment)
+    }
+
+    fn endpoint(&mut self, end_ms: u64) -> Option<TranscriptSegment> {
+        let segment = self.finish(end_ms);
+        self.index += 1;
+        self.start_ms = end_ms;
+        segment
+    }
 }
 
 impl Default for StreamingAdapter {
@@ -106,10 +150,8 @@ impl StreamingAdapter {
         Self {
             recognizer: None,
             stream: None,
-            builder: SegmentBuilder::new(),
-            utterance: 0,
+            utterance: UtteranceState::default(),
             samples_fed: 0,
-            utterance_start_ms: 0,
             flushed: false,
         }
     }
@@ -122,44 +164,37 @@ impl StreamingAdapter {
         self.stream.as_ref().ok_or(AsrError::NotInitialized)
     }
 
-    fn drain(&mut self, out: &mut Vec<TranscriptSegment>) -> Result<(), AsrError> {
+    fn drain(
+        &mut self,
+        out: &mut Vec<TranscriptSegment>,
+        finish_input: bool,
+    ) -> Result<(), AsrError> {
         let rec = self.recognizer.as_ref().ok_or(AsrError::NotInitialized)?;
         let stream = self.stream.as_ref().ok_or(AsrError::NotInitialized)?;
-
-        let mut pending: Option<(i64, String)> = None;
+        let end_ms = self.now_ms();
 
         while rec.is_ready(stream) {
             rec.decode(stream);
 
             if let Some(r) = rec.get_result(stream) {
-                if !r.text.trim().is_empty() {
-                    pending = Some((self.utterance, r.text));
-                }
+                self.utterance.observe(&r.text);
             }
 
             if rec.is_endpoint(stream) {
-                if let Some((utt, text)) = pending.take() {
-                    let text = crate::asr::latin_case::restore_sentence_case(&text);
-                    let end = self.now_ms();
-                    out.push(
-                        self.builder
-                            .build(utt, &text, self.utterance_start_ms, end, true),
-                    );
-                    self.builder.forget(utt);
+                if let Some(segment) = self.utterance.endpoint(end_ms) {
+                    out.push(segment);
                 }
                 rec.reset(stream);
-                self.utterance += 1;
-                self.utterance_start_ms = self.now_ms();
             }
         }
 
-        if let Some((utt, text)) = pending {
-            let text = crate::asr::latin_case::restore_sentence_case(&text);
-            let end = self.now_ms();
-            out.push(
-                self.builder
-                    .build(utt, &text, self.utterance_start_ms, end, false),
-            );
+        let segment = if finish_input {
+            self.utterance.finish(end_ms)
+        } else {
+            self.utterance.partial(end_ms)
+        };
+        if let Some(segment) = segment {
+            out.push(segment);
         }
 
         Ok(())
@@ -201,9 +236,8 @@ impl AsrEngine for StreamingAdapter {
 
         self.recognizer = Some(recognizer);
         self.stream = Some(stream);
-        self.utterance = 0;
+        self.utterance = UtteranceState::default();
         self.samples_fed = 0;
-        self.utterance_start_ms = 0;
         self.flushed = false;
         Ok(())
     }
@@ -213,6 +247,11 @@ impl AsrEngine for StreamingAdapter {
     }
 
     fn feed_pcm(&mut self, pcm: &[f32]) -> Result<Vec<TranscriptSegment>, AsrError> {
+        if self.flushed {
+            return Err(AsrError::InvalidConfig(
+                "语音输入已结束，请重新初始化引擎后再输入音频".into(),
+            ));
+        }
         if self.recognizer.is_none() {
             return Err(AsrError::NotInitialized);
         }
@@ -221,7 +260,7 @@ impl AsrEngine for StreamingAdapter {
         self.samples_fed += pcm.len() as u64;
 
         let mut out = Vec::new();
-        self.drain(&mut out)?;
+        self.drain(&mut out, false)?;
         Ok(out)
     }
 
@@ -242,16 +281,8 @@ impl AsrEngine for StreamingAdapter {
             stream.accept_waveform(TARGET_SAMPLE_RATE as i32, &tail);
             stream.input_finished();
         }
-        self.samples_fed += tail_len as u64;
-
         let mut out = Vec::new();
-        self.drain(&mut out)?;
-
-        if let Some(last) = out.last_mut() {
-            if last.state == crate::transcript::SegmentState::Partial {
-                last.state = crate::transcript::SegmentState::Final;
-            }
-        }
+        self.drain(&mut out, true)?;
         Ok(out)
     }
 
@@ -264,6 +295,83 @@ impl AsrEngine for StreamingAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcript::{SegmentState, TranscriptStore};
+
+    #[test]
+    fn stop_finalizes_the_last_partial_without_a_new_recognizer_result() {
+        let mut utterance = UtteranceState::default();
+        let mut store = TranscriptStore::new();
+        utterance.observe("最后一句还没到端点");
+        let partial = utterance.partial(600).unwrap();
+        store.apply(vec![partial.clone()]).unwrap();
+        assert!(utterance.partial(700).is_none());
+
+        let final_segment = utterance.finish(750).unwrap();
+        assert_eq!(final_segment.id, partial.id);
+        assert_eq!(final_segment.revision, partial.revision + 1);
+        assert_eq!(final_segment.state, SegmentState::Final);
+        assert_eq!(final_segment.text, partial.text);
+        assert_eq!(final_segment.end_ms, 750);
+        store.apply(vec![final_segment]).unwrap();
+        assert!(utterance.finish(750).is_none());
+        assert_eq!(utterance.builder.tracked(), 0);
+    }
+
+    #[test]
+    fn endpoint_keeps_the_last_hypothesis_when_the_latest_result_is_empty() {
+        let mut utterance = UtteranceState::default();
+        utterance.observe("已经显示的原文");
+        let partial = utterance.partial(500).unwrap();
+        utterance.observe("  ");
+        let final_segment = utterance.endpoint(800).unwrap();
+        assert_eq!(final_segment.id, partial.id);
+        assert_eq!(final_segment.text, partial.text);
+        assert_eq!(final_segment.state, SegmentState::Final);
+        assert!(utterance.finish(800).is_none());
+    }
+
+    #[test]
+    fn endpoint_and_next_partial_keep_separate_ids_and_time_ranges() {
+        let mut utterance = UtteranceState::default();
+        utterance.observe("HELLO THERE");
+        let first_partial = utterance.partial(400).unwrap();
+        utterance.observe("HELLO THERE FRIEND");
+        let first_final = utterance.endpoint(800).unwrap();
+        utterance.observe("下一句");
+        let next_partial = utterance.partial(900).unwrap();
+
+        assert_eq!(first_partial.id, first_final.id);
+        assert_eq!(first_final.text, "Hello there friend");
+        assert_eq!(first_final.start_ms, 0);
+        assert_eq!(first_final.end_ms, 800);
+        assert_ne!(first_final.id, next_partial.id);
+        assert_eq!(next_partial.start_ms, 800);
+        assert_eq!(next_partial.end_ms, 900);
+        assert_eq!(next_partial.revision, 1);
+        assert_eq!(utterance.builder.tracked(), 1);
+    }
+
+    #[test]
+    fn silent_endpoints_do_not_create_empty_segments() {
+        let mut utterance = UtteranceState::default();
+        assert!(utterance.endpoint(2400).is_none());
+        assert!(utterance.finish(2500).is_none());
+        utterance.observe("静音之后的第一句");
+        let segment = utterance.finish(3000).unwrap();
+        assert_eq!(segment.start_ms, 2400);
+        assert_eq!(segment.end_ms, 3000);
+        assert_eq!(segment.revision, 1);
+    }
+
+    #[test]
+    fn feed_after_flush_is_rejected_before_calling_the_native_stream() {
+        let mut adapter = StreamingAdapter::new();
+        adapter.flushed = true;
+        assert!(matches!(
+            adapter.feed_pcm(&[0.0; 1600]),
+            Err(AsrError::InvalidConfig(_))
+        ));
+    }
 
     #[test]
     fn discover_reports_missing_dir_clearly() {

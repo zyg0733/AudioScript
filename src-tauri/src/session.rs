@@ -92,8 +92,6 @@ pub struct AudioStatus {
     pub segments: u32,
 }
 
-const EMIT_INTERVAL: Duration = Duration::from_millis(100);
-
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 const LEVEL_INTERVAL: Duration = Duration::from_millis(200);
@@ -137,6 +135,7 @@ struct RunningSession {
     device_sample_rate: u32,
 
     translation: Option<TranslationSession>,
+    traditional_source: bool,
     events: Sender<UiEvent>,
 }
 
@@ -379,6 +378,17 @@ impl SessionState {
             .to_vec()
     }
 
+    pub fn export_snapshot(&self) -> Result<Vec<TranscriptSegment>, String> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .expect("session lifecycle mutex poisoned");
+        if self.teardown_active.load(Ordering::SeqCst) {
+            return Err("会话仍在收尾，末句与译文尚未完成，请稍后再导出".into());
+        }
+        Ok(self.snapshot())
+    }
+
     pub fn is_running(&self) -> bool {
         self.lifecycle
             .lock()
@@ -598,11 +608,6 @@ pub fn start(
     let queue_for_sink = translation.as_ref().map(|t| Arc::clone(&t.queue));
     let events_for_sink = events.clone();
 
-    let mut last_emit = Instant::now()
-        .checked_sub(EMIT_INTERVAL)
-        .unwrap_or_else(Instant::now);
-    let mut pending: Vec<TranscriptSegment> = Vec::new();
-
     let mut last_beat = Instant::now();
     let mut energy = 0.0f64;
     let mut energy_n = 0usize;
@@ -613,8 +618,8 @@ pub fn start(
     let mut level_emit_failed = false;
 
     tracing::info!("启动采集");
-    let translate_source_is_zh = cfg.translate.source_lang.starts_with("zh");
-    let zh_script = cfg.translate.zh_script;
+    let traditional_source = cfg.translate.source_lang.starts_with("zh")
+        && cfg.translate.zh_script == ZhScript::Traditional;
     let audio_clock = Arc::clone(&state.audio_started_at);
     let events_for_failure = events.clone();
     let capture = audio::start(source, device.as_deref(), move |chunk: &[f32]| {
@@ -702,7 +707,7 @@ pub fn start(
             energy_n = 0;
         }
 
-        let mut deltas = {
+        let deltas = {
             let mut eng = engine_for_sink.lock().expect("engine mutex poisoned");
             eng.feed_pcm(chunk)
                 .map_err(|e| format!("语音识别中断：{e}"))?
@@ -710,49 +715,28 @@ pub fn start(
         if deltas.is_empty() {
             return Ok(());
         }
-        if translate_source_is_zh && zh_script == ZhScript::Traditional {
-            for d in &mut deltas {
-                d.text = crate::translate::script::to_traditional(&d.text);
+        let changed = apply_asr_output(
+            &store,
+            deltas,
+            traditional_source,
+            queue_for_sink.as_deref(),
+            &events_for_sink,
+        )?;
+        for seg in &changed {
+            if seg.state.is_frozen() {
+                let audio_ms: i128 = audio_clock
+                    .lock()
+                    .expect("audio start mutex poisoned")
+                    .map(|a| a.elapsed().as_millis() as i128)
+                    .unwrap_or(0);
+                tracing::info!(
+                    start_ms = seg.start_ms,
+                    end_ms = seg.end_ms,
+                    gap_ms = audio_ms - seg.end_ms as i128,
+                    "[定稿] {}",
+                    seg.text
+                );
             }
-        }
-
-        let to_translate = {
-            let mut s = store.lock().expect("transcript store mutex poisoned");
-            match s.apply(deltas) {
-                Ok(changed) => {
-                    for seg in &changed {
-                        if seg.state != crate::transcript::SegmentState::Partial {
-                            let audio_ms: i128 = audio_clock
-                                .lock()
-                                .expect("audio start mutex poisoned")
-                                .map(|a| a.elapsed().as_millis() as i128)
-                                .unwrap_or(0);
-                            tracing::info!(
-                                start_ms = seg.start_ms,
-                                end_ms = seg.end_ms,
-                                gap_ms = audio_ms - seg.end_ms as i128,
-                                "[定稿] {}",
-                                seg.text
-                            );
-                        }
-                    }
-
-                    let marked = schedule_translation(&mut s, &changed, queue_for_sink.as_deref());
-                    pending.extend(changed);
-                    marked
-                }
-                Err(e) => {
-                    return Err(format!("段落状态机拒绝了引擎输出：{e}"));
-                }
-            }
-        };
-
-        pending.extend(to_translate);
-
-        if last_emit.elapsed() >= EMIT_INTERVAL && !pending.is_empty() {
-            let batch = coalesce(std::mem::take(&mut pending));
-            let _ = events_for_sink.send(UiEvent::Segments(batch));
-            last_emit = Instant::now();
         }
         Ok(())
     }, move |message| {
@@ -777,6 +761,7 @@ pub fn start(
         device: device_name,
         device_sample_rate,
         translation,
+        traditional_source,
         events: events.clone(),
     };
     let published = {
@@ -890,7 +875,7 @@ fn fail_session(app: &AppHandle, epoch: u64, message: String) {
 fn schedule_teardown(app: &AppHandle, session: RunningSession) {
     session.capture.request_stop();
     if let Some(translation) = &session.translation {
-        let jobs = translation.queue.close_and_drain();
+        let jobs = translation.queue.drain_pending();
         let changed = cancel_translation_jobs(
             &mut app
                 .state::<SessionState>()
@@ -957,6 +942,7 @@ fn teardown(app: &AppHandle, session: RunningSession) {
         capture,
         engine,
         translation,
+        traditional_source,
         events,
         ..
     } = session;
@@ -965,6 +951,9 @@ fn teardown(app: &AppHandle, session: RunningSession) {
     tracing::info!("收尾：等待采集线程退出");
     drop(capture);
     tracing::info!(ms = t0.elapsed().as_millis(), "收尾：采集线程已退出");
+    if let Some(translation) = &translation {
+        translation.queue.close();
+    }
 
     tracing::info!("收尾：冲刷引擎");
     let tail = {
@@ -976,10 +965,7 @@ fn teardown(app: &AppHandle, session: RunningSession) {
     let changed = match tail {
         Ok(tail) if !tail.is_empty() => {
             let state = app.state::<SessionState>();
-            let applied = {
-                let mut s = state.store.lock().expect("transcript store mutex poisoned");
-                s.apply(tail)
-            };
+            let applied = apply_asr_output(&state.store, tail, traditional_source, None, &events);
             match applied {
                 Ok(changed) => changed,
                 Err(e) => {
@@ -998,7 +984,6 @@ fn teardown(app: &AppHandle, session: RunningSession) {
 
     let state = app.state::<SessionState>();
     let changed = if let Some(translation) = translation {
-        translation.queue.close();
         if translation.done.recv().is_err() {
             tracing::error!("翻译工作线程异常退出");
         }
@@ -1022,6 +1007,33 @@ fn teardown(app: &AppHandle, session: RunningSession) {
 pub fn clear(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<SessionState>();
     state.clear_with(|segments| broadcast_segments(app, segments))
+}
+
+fn apply_asr_output(
+    store: &Mutex<TranscriptStore>,
+    mut deltas: Vec<TranscriptSegment>,
+    traditional_source: bool,
+    queue: Option<&JobQueue>,
+    events: &Sender<UiEvent>,
+) -> Result<Vec<TranscriptSegment>, String> {
+    if traditional_source {
+        for segment in &mut deltas {
+            segment.text = crate::translate::script::to_traditional(&segment.text);
+        }
+    }
+    let mut store = store.lock().expect("transcript store mutex poisoned");
+    let changed = store
+        .apply(deltas)
+        .map_err(|error| format!("段落状态机拒绝了引擎输出：{error}"))?;
+    if !changed.is_empty() {
+        // 新段落必须先于翻译任务广播，否则快速译文会改变前端首次看到的段序。
+        let _ = events.send(UiEvent::Segments(changed.clone()));
+        let updates = schedule_translation(&mut store, &changed, queue);
+        if !updates.is_empty() {
+            let _ = events.send(UiEvent::Segments(updates));
+        }
+    }
+    Ok(changed)
 }
 
 fn translate_final_tail(
@@ -1195,6 +1207,100 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_audio_updates_publish_the_last_final_without_another_chunk() {
+        let store = Mutex::new(TranscriptStore::new());
+        let (events, receiver) = std::sync::mpsc::channel();
+        apply_asr_output(&store, vec![seg("last", "最后", 1)], false, None, &events).unwrap();
+        let mut final_segment = finalized("last");
+        final_segment.text = "最后一句。".into();
+        final_segment.revision = 2;
+        apply_asr_output(&store, vec![final_segment], false, None, &events).unwrap();
+        apply_asr_output(&store, Vec::new(), false, None, &events).unwrap();
+
+        let batches = receiver
+            .try_iter()
+            .map(|event| match event {
+                UiEvent::Segments(segments) => segments,
+                _ => panic!("只应广播段落"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batches.len(), 2, "连续回调的最终定稿不能等待下一次出字");
+        assert_eq!(batches[1][0].state, SegmentState::Final);
+        assert_eq!(batches[1][0].text, "最后一句。");
+    }
+
+    #[test]
+    fn source_order_is_published_before_a_fast_translation_worker() {
+        let store = Arc::new(Mutex::new(TranscriptStore::new()));
+        let queue = Arc::new(JobQueue::new(1));
+        let (events, receiver) = std::sync::mpsc::channel();
+        let (commands, command_receiver) = std::sync::mpsc::channel();
+        let (done, completion) = std::sync::mpsc::channel();
+        let mut translator = crate::translate::mock::MockTranslator::new(Duration::ZERO, 0);
+        translator.init(&TranslateConfig::default()).unwrap();
+        commands
+            .send(TranslateCommand::Start {
+                queue: Arc::clone(&queue),
+                translator: Arc::new(Mutex::new(Box::new(translator))),
+                store: Arc::clone(&store),
+                events: events.clone(),
+                done,
+            })
+            .unwrap();
+        let worker = std::thread::spawn(move || run_translate_worker(command_receiver));
+        apply_asr_output(
+            &store,
+            vec![finalized("first"), finalized("second")],
+            false,
+            Some(&queue),
+            &events,
+        )
+        .unwrap();
+        queue.close();
+        completion.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(commands);
+        worker.join().unwrap();
+
+        let UiEvent::Segments(first) = receiver.try_recv().unwrap() else {
+            panic!("首个事件必须包含源段落");
+        };
+        assert_eq!(
+            first
+                .iter()
+                .map(|segment| segment.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert!(first
+            .iter()
+            .all(|s| s.translation_state == TranslationState::Idle));
+        assert!(receiver.try_iter().any(|event| matches!(
+            event,
+            UiEvent::Segments(segments) if segments.iter().any(|s| s.translation_state == TranslationState::Done)
+        )));
+    }
+
+    #[test]
+    fn traditional_source_is_consistent_through_flush_translation_and_export() {
+        let store = Mutex::new(TranscriptStore::new());
+        let (events, _) = std::sync::mpsc::channel();
+        apply_asr_output(&store, vec![seg("tail", "测试", 1)], true, None, &events).unwrap();
+        let mut tail = finalized("tail");
+        tail.text = "测试记录".into();
+        tail.revision = 2;
+        let changed = apply_asr_output(&store, vec![tail], true, None, &events).unwrap();
+        assert_eq!(changed[0].text, "測試記錄");
+        let mut translator = crate::translate::mock::MockTranslator::new(Duration::ZERO, 0);
+        translator.init(&TranslateConfig::default()).unwrap();
+        let translated = translate_final_tail(&store, changed, Some(&mut translator));
+        assert_eq!(translated[0].translation.as_deref(), Some("⟦译⟧測試記錄"));
+        let store = store.lock().unwrap();
+        let markdown = crate::transcript::to_markdown(store.snapshot(), "测试时间", None);
+        assert!(markdown.contains("測試記錄"));
+        assert!(!markdown.contains("测试记录"));
+    }
+
+    #[test]
     fn translation_off_keeps_snapshot_and_export_without_fake_translation() {
         let mut store = TranscriptStore::new();
         let changed = store.apply(vec![finalized("off")]).unwrap();
@@ -1228,7 +1334,8 @@ mod tests {
             .iter()
             .any(|s| s.id == "old" && s.translation_state == TranslationState::Failed));
 
-        let cancelled = cancel_translation_jobs(&mut store, queue.close_and_drain(), "已停止");
+        let cancelled = cancel_translation_jobs(&mut store, queue.drain_pending(), "已停止");
+        queue.close();
         assert_eq!(cancelled.len(), 1);
         assert!(store
             .snapshot()
@@ -1241,6 +1348,65 @@ mod tests {
             store.get("after-stop").unwrap().translation_state,
             TranslationState::Failed
         );
+    }
+
+    #[test]
+    fn stopping_cancels_old_backlog_but_translates_the_last_audio_chunk() {
+        let store = Arc::new(Mutex::new(TranscriptStore::new()));
+        let queue = Arc::new(JobQueue::new(4));
+        let (events, _) = std::sync::mpsc::channel();
+        apply_asr_output(
+            &store,
+            vec![finalized("backlog")],
+            false,
+            Some(&queue),
+            &events,
+        )
+        .unwrap();
+        {
+            let mut store = store.lock().unwrap();
+            cancel_translation_jobs(&mut store, queue.drain_pending(), "已停止");
+        }
+        // 采集器收到停止请求后，仍须投喂设备与重采样器缓冲的最后一块音频。
+        apply_asr_output(
+            &store,
+            vec![finalized("last-chunk")],
+            false,
+            Some(&queue),
+            &events,
+        )
+        .unwrap();
+        queue.close();
+
+        let mut translator = crate::translate::mock::MockTranslator::new(Duration::ZERO, 0);
+        translator.init(&TranslateConfig::default()).unwrap();
+        let (commands, receiver) = std::sync::mpsc::channel();
+        let (done, completion) = std::sync::mpsc::channel();
+        commands
+            .send(TranslateCommand::Start {
+                queue,
+                translator: Arc::new(Mutex::new(Box::new(translator))),
+                store: Arc::clone(&store),
+                events,
+                done,
+            })
+            .unwrap();
+        drop(commands);
+        let worker = std::thread::spawn(move || run_translate_worker(receiver));
+        completion.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+
+        let store = store.lock().unwrap();
+        assert_eq!(
+            store.get("backlog").unwrap().translation_state,
+            TranslationState::Failed
+        );
+        assert_eq!(
+            store.get("last-chunk").unwrap().translation_state,
+            TranslationState::Done
+        );
+        let markdown = crate::transcript::to_markdown(store.snapshot(), "测试时间", None);
+        assert!(markdown.contains("> ⟦译⟧只有原文"));
     }
 
     #[test]
@@ -1321,6 +1487,38 @@ mod tests {
             .clear_with(|segments| assert!(segments.is_empty()))
             .unwrap();
         assert!(state.snapshot().is_empty());
+    }
+
+    #[test]
+    fn export_waits_for_stop_to_finish_the_last_sentence_and_translation() {
+        let state = SessionState::default();
+        let mut partial = seg("export-tail", "最后一句", 1);
+        state
+            .store
+            .lock()
+            .unwrap()
+            .apply(vec![partial.clone()])
+            .unwrap();
+        state.teardown_active.store(true, Ordering::SeqCst);
+        assert!(state
+            .export_snapshot()
+            .unwrap_err()
+            .contains("请稍后再导出"));
+
+        partial.state = SegmentState::Final;
+        partial.revision = 2;
+        {
+            let mut store = state.store.lock().unwrap();
+            store.apply(vec![partial]).unwrap();
+            store
+                .set_translation("export-tail", Ok("Last sentence.".into()))
+                .unwrap();
+        }
+        state.teardown_active.store(false, Ordering::SeqCst);
+        let snapshot = state.export_snapshot().unwrap();
+        let markdown = crate::transcript::to_markdown(&snapshot, "测试时间", None);
+        assert!(markdown.contains("最后一句"));
+        assert!(markdown.contains("> Last sentence."));
     }
 
     #[test]

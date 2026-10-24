@@ -523,7 +523,10 @@ fn export_transcript(
     stamp: &str,
     dest: &std::path::Path,
 ) -> Result<std::path::PathBuf, CmdError> {
-    let segments = app.state::<session::SessionState>().snapshot();
+    let segments = app
+        .state::<session::SessionState>()
+        .export_snapshot()
+        .map_err(CmdError::Failed)?;
     let p = prefs::load(app);
     let direction = match p.translate_engine {
         TranslateEngine::Off => None,
