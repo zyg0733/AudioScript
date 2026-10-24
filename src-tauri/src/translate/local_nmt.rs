@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use ct2rs::tokenizers::hf::Tokenizer as HfTokenizer;
 
@@ -153,6 +154,7 @@ impl LocalNmt {
 
 impl Translator for LocalNmt {
     fn init(&mut self, cfg: &TranslateConfig) -> Result<(), TranslateError> {
+        let started = Instant::now();
         self.direction = Direction::resolve(&cfg.source_lang, &cfg.target_lang)?;
         self.script = cfg.zh_script;
 
@@ -169,18 +171,33 @@ impl Translator for LocalNmt {
         };
 
         let tok = MarianTokenizer::load(&dir)?;
+        let tokenizer_ms = started.elapsed().as_millis();
+        let native_started = Instant::now();
         let engine = ct2rs::Translator::with_tokenizer(&dir, tok, &config)
             .map_err(|e| TranslateError::ModelLoad(format!("{}：{e}", dir.display())))?;
 
-        self.engine = Some(engine);
-
+        let native_load_ms = native_started.elapsed().as_millis();
         let warm = match self.direction {
-            Direction::EnZh => "hello",
-            Direction::ZhEn => "你好",
+            Direction::EnZh => "Hello, world.",
+            Direction::ZhEn => "今天天气很好。",
         };
-        if let Err(e) = self.translate(warm) {
+        // 必须在启动线程完成惰性初始化；预热不能沿用正式翻译的 256 token 上限。
+        let warm_options = ct2rs::TranslationOptions {
+            beam_size: 1,
+            max_decoding_length: 16,
+            ..Default::default()
+        };
+        let warm_started = Instant::now();
+        if let Err(e) = engine.translate_batch(&[warm], &warm_options, None) {
             tracing::warn!("翻译引擎预热返回异常（忽略）：{e}");
         }
+        tracing::info!(
+            tokenizer_ms,
+            native_load_ms,
+            warmup_ms = warm_started.elapsed().as_millis(),
+            "本地翻译引擎初始化完成"
+        );
+        self.engine = Some(engine);
 
         Ok(())
     }
@@ -264,8 +281,14 @@ mod tests {
 
     #[test]
     fn tiers_map_to_their_direction_directories() {
-        assert_eq!(Direction::EnZh.dir_name(MtModelTier::Base), "opus-mt-en-zh-ct2");
-        assert_eq!(Direction::ZhEn.dir_name(MtModelTier::Base), "opus-mt-zh-en-ct2");
+        assert_eq!(
+            Direction::EnZh.dir_name(MtModelTier::Base),
+            "opus-mt-en-zh-ct2"
+        );
+        assert_eq!(
+            Direction::ZhEn.dir_name(MtModelTier::Base),
+            "opus-mt-zh-en-ct2"
+        );
         assert_eq!(
             Direction::EnZh.dir_name(MtModelTier::Big),
             "opus-mt-tc-big-en-zh-ct2"

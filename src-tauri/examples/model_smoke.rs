@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
 use app_lib::asr::streaming::StreamingAdapter;
@@ -16,6 +16,7 @@ use app_lib::translate::{degenerate_translation, Translator};
 const USAGE: &str =
     "用法：model_smoke --models-root <解包后的 models 目录> [--wav <16 kHz 单声道 PCM16 WAV>]";
 const MAX_WAV_BYTES: usize = 32 * 1024 * 1024;
+const MODEL_INIT_BUDGET: Duration = Duration::from_secs(45);
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
@@ -52,6 +53,11 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Options
 }
 
 fn main() -> ExitCode {
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stdout)
+        .try_init();
     let result = parse_args(std::env::args_os().skip(1)).and_then(|options| match options {
         Some(options) => run(options),
         None => {
@@ -117,14 +123,14 @@ fn run(options: Options) -> Result<()> {
         }
     };
     println!("从解包资源加载模型：{}", root.display());
-    smoke_asr(&asr_dir, &pcm, options.wav.is_some())?;
-    smoke_translation(&mt_dir, "en", "zh", "Hello, world.")?;
-    smoke_translation(&mt_dir, "zh", "en", "今天天气很好。")?;
+    let asr_init = smoke_asr(&asr_dir, &pcm, options.wav.is_some())?;
+    smoke_translation(&mt_dir, "en", "zh", "Hello, world.", asr_init)?;
+    smoke_translation(&mt_dir, "zh", "en", "今天天气很好。", asr_init)?;
     println!("模型冒烟验证通过（{} ms）", started.elapsed().as_millis());
     Ok(())
 }
 
-fn smoke_asr(model_dir: &Path, pcm: &[f32], expect_speech: bool) -> Result<()> {
+fn smoke_asr(model_dir: &Path, pcm: &[f32], expect_speech: bool) -> Result<Duration> {
     let started = Instant::now();
     let cfg = AsrConfig {
         model_dir: Some(
@@ -136,8 +142,12 @@ fn smoke_asr(model_dir: &Path, pcm: &[f32], expect_speech: bool) -> Result<()> {
         ..Default::default()
     };
     let mut engine = StreamingAdapter::new();
-    engine.init(&cfg).context("ASR 初始化失败")?;
-    let result = (|| {
+    let init_started = Instant::now();
+    let initialized = engine.init(&cfg);
+    let init_elapsed = init_started.elapsed();
+    println!("ASR 初始化耗时：{} ms", init_elapsed.as_millis());
+    initialized.context("ASR 初始化失败")?;
+    let result: Result<()> = (|| {
         let duration_ms = pcm.len() as u64 * 1000 / TARGET_SAMPLE_RATE as u64;
         let mut store = TranscriptStore::new();
         for chunk in pcm.chunks(CHUNK_SAMPLES) {
@@ -165,15 +175,18 @@ fn smoke_asr(model_dir: &Path, pcm: &[f32], expect_speech: bool) -> Result<()> {
                 segment.start_ms, segment.end_ms, segment.text
             );
         }
-        println!(
-            "ASR 初始化、投喂、收尾通过（{} 段，{} ms）",
-            segments.len(),
-            started.elapsed().as_millis()
-        );
+        println!("ASR 投喂与收尾通过（{} 段）", segments.len());
         Ok(())
     })();
+    let shutdown_started = Instant::now();
     engine.shutdown();
-    result
+    println!(
+        "ASR 关闭耗时：{} ms；ASR 总耗时：{} ms",
+        shutdown_started.elapsed().as_millis(),
+        started.elapsed().as_millis()
+    );
+    result?;
+    Ok(init_elapsed)
 }
 
 fn apply_asr_deltas(
@@ -204,7 +217,26 @@ fn apply_asr_deltas(
     Ok(())
 }
 
-fn smoke_translation(model_dir: &Path, from: &str, to: &str, input: &str) -> Result<()> {
+fn verify_startup_budget(asr_init: Duration, nmt_init: Duration) -> Result<()> {
+    let total = asr_init.saturating_add(nmt_init);
+    ensure!(
+        total <= MODEL_INIT_BUDGET,
+        "模型初始化超过启动预算：ASR {} ms + NMT（含预热）{} ms = {} ms，上限 {} ms；真实会话启动还需为其他步骤预留 15 秒",
+        asr_init.as_millis(),
+        nmt_init.as_millis(),
+        total.as_millis(),
+        MODEL_INIT_BUDGET.as_millis()
+    );
+    Ok(())
+}
+
+fn smoke_translation(
+    model_dir: &Path,
+    from: &str,
+    to: &str,
+    input: &str,
+    asr_init: Duration,
+) -> Result<()> {
     let started = Instant::now();
     let mut translator = LocalNmt::new(model_dir.to_path_buf(), MtModelTier::Base);
     let cfg = TranslateConfig {
@@ -212,12 +244,37 @@ fn smoke_translation(model_dir: &Path, from: &str, to: &str, input: &str) -> Res
         target_lang: to.to_owned(),
         ..Default::default()
     };
-    translator
-        .init(&cfg)
-        .with_context(|| format!("NMT {from}→{to} 初始化失败"))?;
-    let result = translator.translate(input);
+    let init_started = Instant::now();
+    let initialized = translator.init(&cfg);
+    let init_elapsed = init_started.elapsed();
+    println!(
+        "NMT {from}→{to} 初始化耗时（含预热）：{} ms",
+        init_elapsed.as_millis()
+    );
+    let result = (|| {
+        initialized.with_context(|| format!("NMT {from}→{to} 初始化失败"))?;
+        verify_startup_budget(asr_init, init_elapsed)
+            .with_context(|| format!("NMT {from}→{to} 未通过会话启动预算"))?;
+        println!(
+            "NMT {from}→{to} 会话模型初始化预算通过：ASR + NMT = {} ms，预算 {} ms",
+            asr_init.saturating_add(init_elapsed).as_millis(),
+            MODEL_INIT_BUDGET.as_millis()
+        );
+        let translate_started = Instant::now();
+        let result = translator.translate(input);
+        println!(
+            "NMT {from}→{to} 单句推理耗时：{} ms",
+            translate_started.elapsed().as_millis()
+        );
+        result.with_context(|| format!("NMT {from}→{to} 推理失败"))
+    })();
+    let shutdown_started = Instant::now();
     translator.shutdown();
-    let output = result.with_context(|| format!("NMT {from}→{to} 推理失败"))?;
+    println!(
+        "NMT {from}→{to} 关闭耗时：{} ms",
+        shutdown_started.elapsed().as_millis()
+    );
+    let output = result?;
     ensure!(!output.trim().is_empty(), "NMT {from}→{to} 返回空译文");
     ensure!(
         degenerate_translation(&output).is_none(),
@@ -304,6 +361,21 @@ fn parse_pcm16_wav(bytes: &[u8]) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_budget_accepts_44_and_45_seconds_but_rejects_46_seconds() {
+        for seconds in [44, 45] {
+            assert!(verify_startup_budget(Duration::ZERO, Duration::from_secs(seconds)).is_ok());
+        }
+        assert!(verify_startup_budget(Duration::ZERO, Duration::from_secs(46)).is_err());
+    }
+
+    #[test]
+    fn startup_budget_adds_asr_and_nmt_initialization_and_preserves_submillisecond_precision() {
+        assert!(verify_startup_budget(Duration::from_secs(4), Duration::from_secs(41)).is_ok());
+        assert!(verify_startup_budget(Duration::from_secs(5), Duration::from_secs(41)).is_err());
+        assert!(verify_startup_budget(MODEL_INIT_BUDGET, Duration::from_nanos(1)).is_err());
+    }
 
     fn fmt_chunk(format: u16, channels: u16, sample_rate: u32, bits: u16) -> Vec<u8> {
         let align = channels * (bits / 8);
