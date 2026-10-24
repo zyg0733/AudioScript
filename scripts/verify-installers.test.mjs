@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
-import { expectedModelFiles, sameVersion, verifyExecutableHeader, verifyExtracted, verifyLddResult, verifyMacInfo, verifyModelCopies } from './verify-installers.mjs'
+import { expectedModelFiles, run, runModelSmoke, sameVersion, verifyExecutableHeader, verifyExtracted, verifyLddResult, verifyMacInfo, verifyModelCopies } from './verify-installers.mjs'
 
 const catalog = {
   models: [
@@ -175,4 +176,49 @@ test('Linux ldd 缺失依赖总失败，静态程序无依赖输出允许通过'
   }
   assert.throws(() => verifyLddResult({ status: 1, stderr: 'Permission denied' }), /ldd 验证失败/)
   assert.throws(() => verifyLddResult({ error: new Error('ENOENT') }), /无法执行 ldd/)
+})
+
+test('Windows/Linux 对同一模型和音频额外运行禁用 MKL 的 smoke 并保留输出', async (t) => {
+  const { root } = await fixture(t)
+  const script = join(root, 'smoke-fixture.mjs')
+  await put(script, `console.log(JSON.stringify({ args: process.argv.slice(2), mkl: process.env.CT2_USE_MKL ?? 'auto' }))`)
+  const execute = (file, args, options) => {
+    const child = spawnSync(process.execPath, [file, ...args], { ...options, encoding: 'utf8' })
+    assert.equal(child.status, 0, child.stderr)
+    return child.stdout
+  }
+  for (const platform of ['windows-x64', 'linux-x64']) {
+    const results = runModelSmoke(script, { platform, modelsRoot: '/fixture/models', wav: '/fixture/audio.wav' }, execute)
+    assert.deepEqual(results.map((result) => result.mode), ['default', 'mkl-disabled'])
+    const normal = JSON.parse(results[0].output)
+    const fallback = JSON.parse(results[1].output)
+    assert.deepEqual(fallback.args, ['--models-root', '/fixture/models', '--wav', '/fixture/audio.wav'])
+    assert.deepEqual(fallback.args, normal.args)
+    assert.equal(fallback.mkl, '0')
+  }
+  const mac = runModelSmoke(script, { platform: 'macos-arm64', modelsRoot: '/fixture/models' }, execute)
+  assert.deepEqual(mac.map((result) => result.mode), ['default'])
+  assert.deepEqual(JSON.parse(mac[0].output).args, ['--models-root', '/fixture/models'])
+})
+
+test('MKL 禁用后的回退推理失败必须使验证失败', async (t) => {
+  const { root } = await fixture(t)
+  const script = join(root, 'smoke-failure.mjs')
+  await put(script, `if (process.env.CT2_USE_MKL === '0') { console.error('No SGEMM backend on CPU'); process.exit(1) }; console.log('default inference passed')`)
+  const execute = (file, args, options) => {
+    const env = { ...options.env }
+    if (options.env === process.env) delete env.CT2_USE_MKL
+    const child = spawnSync(process.execPath, [file, ...args], { ...options, env, encoding: 'utf8' })
+    assert.equal(child.status, 0, child.stderr)
+    return child.stdout
+  }
+  assert.throws(() => runModelSmoke(script, { platform: 'linux-x64', modelsRoot: '/fixture/models' }, execute), /No SGEMM backend/)
+})
+
+test('模型失败保留 stdout 成功步骤与 stderr 故障原因，不能互相遮盖', () => {
+  assert.throws(() => run(process.execPath, ['-e', `console.log('ASR 初始化及识别成功'); console.error('NMT No SGEMM backend on CPU'); process.exit(1)`]), (error) => {
+    assert.match(error.message, /ASR 初始化及识别成功/)
+    assert.match(error.message, /NMT No SGEMM backend on CPU/)
+    return true
+  })
 })

@@ -107,12 +107,19 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 block2 = "0.6"
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-# ct2rs README 给 Windows 与 Linux(non-ARM) 的推荐 BLAS 都是 mkl。
-# ⚠️ 这条路径尚未在真机验证——CI 只跑 cargo check，见 .github/workflows/build.yml 的 check-* job。
+[target.'cfg(target_os = "linux")'.dependencies]
+# MKL 默认仅用于 Intel CPU；必须保留 Ruy 回退，否则其他 CPU 上翻译会报 No SGEMM backend。
 ct2rs = { version = "0.10", default-features = false, features = [
     "tokenizers",
     "mkl",
+    "ruy",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# 使用随库编译的静态 Ruy；oneMKL 预构建在 MSVC 上缺少所需的 mkl_intel_ilp64 静态库。
+ct2rs = { version = "0.10", default-features = false, features = [
+    "tokenizers",
+    "ruy",
 ] }
 
 [target.'cfg(unix)'.dependencies]
