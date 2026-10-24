@@ -7,7 +7,9 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const project = JSON.parse(readFileSync(resolve(root, 'project.json'), 'utf8'))
 const publicKey = (process.env.TAURI_UPDATER_PUBLIC_KEY ?? '').trim()
 const signingKeyPresent = Boolean(process.env.TAURI_SIGNING_PRIVATE_KEY?.trim())
-const required = process.argv.includes('--require-updater') || /^refs\/tags\/v/.test(process.env.GITHUB_REF ?? '')
+const mode = process.env.AUDIOSCRIPT_RELEASE_MODE || 'auto'
+const required = mode === 'signed-updater' || process.argv.includes('--require-updater') || /^refs\/tags\/v/.test(process.env.GITHUB_REF ?? '')
+const installersOnly = mode === 'installers-only' || process.argv.includes('--installers-only')
 const outputFlag = process.argv.indexOf('--output')
 
 function fail(message) {
@@ -15,7 +17,13 @@ function fail(message) {
   process.exit(1)
 }
 
-if (publicKey) {
+if (!['auto', 'installers-only', 'signed-updater'].includes(mode)) fail('未知发布模式')
+
+if (installersOnly && required) {
+  fail('仅安装包模式仅用于分支手动验证与发布；tag 签名发布必须配置本项目更新密钥')
+}
+
+if (publicKey && !installersOnly) {
   const text = Buffer.from(publicKey, 'base64').toString('utf8').trim().split(/\r?\n/)
   const bytes = Buffer.from(text[1] ?? '', 'base64')
   if (!text[0]?.startsWith('untrusted comment:') || bytes.length !== 42 || !['Ed', 'ED'].includes(bytes.subarray(0, 2).toString())) {
@@ -27,13 +35,13 @@ if (required && (!publicKey || !signingKeyPresent)) {
   fail('tag 发布需要变量 TAURI_UPDATER_PUBLIC_KEY 和 Secret TAURI_SIGNING_PRIVATE_KEY；请先在仓库 Actions 设置中配置')
 }
 
-const enabled = Boolean(publicKey && signingKeyPresent)
+const enabled = !installersOnly && Boolean(publicKey && signingKeyPresent)
 if (outputFlag >= 0 && !process.argv[outputFlag + 1]) fail('--output 缺少输出路径')
 const output = resolve(root, outputFlag >= 0 ? process.argv[outputFlag + 1] : '.cache/tauri-release.conf.json')
 mkdirSync(dirname(output), { recursive: true })
 writeFileSync(output, `${JSON.stringify({
   bundle: { createUpdaterArtifacts: enabled },
-  plugins: { updater: { pubkey: publicKey, endpoints: [project.updaterEndpoint] } },
+  plugins: { updater: { pubkey: installersOnly ? '' : publicKey, endpoints: [project.updaterEndpoint] } },
 }, null, 2)}\n`)
 
 if (process.env.GITHUB_OUTPUT) {

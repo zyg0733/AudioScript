@@ -12,6 +12,10 @@
 
 ## 自动更新与发布
 
+首个自有版本为 `0.2.11`。没有自有签名密钥时，先手动触发 **Build & Release**，选择 `installers-only`。该模式清空构建公钥、关闭更新工件，不创建公开 Release；三个平台均解包校验架构、版本、模型文件 SHA-256，并从包内资源执行官方语音样本识别与双向翻译。每个平台输出校验报告与安装包 SHA-256 清单，验证通过才上传工件。
+
+手动安装包发布应直接使用上述验证通过的同一次运行工件，先创建 draft Release 并上传五种安装包、汇总校验和及验证报告，确认标签指向构建提交、文件名与官网映射一致后再公开为 latest。不要重新编译后替换已验证的工件，也不要发布空的 `latest.json`。此流程只提供手动下载安装；不会宣称自动更新已可用。
+
 本 fork 不信任原项目公钥，也不向原项目请求更新。普通本地构建默认不生成更新工件；未设置 `TAURI_UPDATER_PUBLIC_KEY` 时不注册更新插件，设置页显示原因，后端拒绝安装更新。公钥必须在构建时提供，只改运行时环境不会启用已构建的应用。
 
 发布前在本仓库 Settings → Secrets and variables → Actions 配置：
@@ -27,7 +31,7 @@
 
 `scripts/configure-release.mjs` 只把公钥和本项目 endpoint 写入被忽略的 `.cache/tauri-release.conf.json`。`v*` tag 发布缺公钥或签名 Secret 会在构建前失败；手动 workflow 缺配置可验证普通安装包，但不生成或上传更新工件。配置公钥但未配置私钥的手动构建可检查既有签名版本，仍不生成更新包。配置错误的公钥格式会直接失败。签名是否配对由构建签名和实际更新验收确认。
 
-建议先手动触发 Build & Release，验证三平台安装包，再发布版本 tag。正式 release 汇总各平台签名到 `latest.json`，仅上传到本仓库 Releases。发布后用上一版本安装包验证：检查更新、签名校验、安装、重启和配置保留；没有通过这条流程前不要宣布自动更新可用。
+配置自有密钥后，手动选择 `signed-updater` 验证签名工件；`v*` tag 推送仍强制要求自有密钥，不能用 `installers-only` 绕过。此签名发布路径汇总各平台签名到 `latest.json`，仅上传到本仓库 Releases。发布后用上一版本安装包验证：检查更新、签名校验、安装、重启和配置保留；没有通过这条流程前不要宣布自动更新可用。
 
 本地需要验证签名构建时，在受控环境中设置上述环境变量，运行 `node scripts/configure-release.mjs --require-updater`，然后运行 `pnpm tauri build --config .cache/tauri-release.conf.json`。不要通过命令行参数传私钥。
 

@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "AudioScript",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "identifier": "io.github.zyg0733.audioscript",
   "build": {
     "frontendDist": "../dist",
@@ -58,6 +58,7 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": false,
+    "macOS": { "minimumSystemVersion": "14.2" },
     "targets": "all",
     "icon": [
       "icons/32x32.png",

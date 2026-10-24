@@ -23,6 +23,7 @@ function run(t, env = {}, args = []) {
       ...process.env,
       GITHUB_REF: '',
       GITHUB_OUTPUT: join(dir, 'github-output'),
+      AUDIOSCRIPT_RELEASE_MODE: 'auto',
       TAURI_UPDATER_PUBLIC_KEY: '',
       TAURI_SIGNING_PRIVATE_KEY: '',
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: '',
@@ -75,4 +76,31 @@ test('无效公钥拒绝构建，不泄露传入值', (t) => {
   assert.equal(existsSync(result.output), false)
   assert.equal(`${result.stdout}${result.stderr}`.includes(invalid), false)
   assert.equal(`${result.stdout}${result.stderr}`.includes(privateFixture), false)
+})
+
+test('显式仅安装包模式不带入更新公钥或工件', (t) => {
+  const result = run(t, {
+    TAURI_UPDATER_PUBLIC_KEY: publicKey,
+    TAURI_SIGNING_PRIVATE_KEY: privateFixture,
+  }, ['--installers-only'])
+  assert.equal(result.status, 0, result.stderr)
+  const raw = readFileSync(result.output, 'utf8')
+  const config = JSON.parse(raw)
+  assert.equal(config.bundle.createUpdaterArtifacts, false)
+  assert.equal(config.plugins.updater.pubkey, '')
+  assert.equal(`${raw}${result.stdout}${result.stderr}`.includes(privateFixture), false)
+})
+
+test('仅安装包模式不能绕过 tag 或强制签名发布', (t) => {
+  for (const [env, args] of [[{ GITHUB_REF: 'refs/tags/v0.2.11' }, []], [{}, ['--require-updater']]]) {
+    const result = run(t, env, ['--installers-only', ...args])
+    assert.notEqual(result.status, 0)
+    assert.equal(existsSync(result.output), false)
+  }
+})
+
+test('工作流显式选择签名更新模式时缺配置必须失败', (t) => {
+  const result = run(t, { AUDIOSCRIPT_RELEASE_MODE: 'signed-updater' })
+  assert.notEqual(result.status, 0)
+  assert.equal(existsSync(result.output), false)
 })
