@@ -259,6 +259,14 @@ async function main() {
 
   for (const pair of PAIRS) {
     await convert(pair)
+    await writeFile(join(MT_DIR, pair.dir, 'NOTICE.txt'), [
+      `Source: https://huggingface.co/${pair.hf}`,
+      'Attribution: Helsinki-NLP / OPUS-MT',
+      `License: ${pair.note.includes('Apache-2.0') ? 'Apache-2.0 (https://www.apache.org/licenses/LICENSE-2.0)' : 'CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/)'}`,
+      'AudioScript converts the model weights to CTranslate2 int8 and the SentencePiece vocabularies to tokenizer JSON.',
+      'Training data is unchanged.',
+      '',
+    ].join('\n'))
   }
 
   const total = await dirSize(MT_DIR)
