@@ -276,20 +276,11 @@ where
 
                 match stream.poll_chunk() {
                     Some(chunk) => {
-                        if let Some(acc) = &probe {
-                            acc.lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .observe(&chunk.data);
-                        }
-                        for &s in &chunk.data {
-                            buf.push(s);
-                            if buf.len() == CHUNK_SAMPLES {
-                                if let Err(error) = sink(&buf) {
-                                    failure = Some(error);
-                                    break 'capture;
-                                }
-                                buf.clear();
-                            }
+                        if let Err(error) =
+                            deliver_chunk(&chunk.data, &mut buf, &mut sink, probe.as_deref())
+                        {
+                            failure = Some(error);
+                            break 'capture;
                         }
                     }
                     None => {
@@ -308,16 +299,104 @@ where
                 }
             }
 
-            if failure.is_none() && !buf.is_empty() {
-                failure = sink(&buf).err();
-            }
+            let failure =
+                finish_capture(&mut stream, &mut buf, &mut sink, probe.as_deref(), failure);
             if let Some(error) = failure {
                 failed(error);
             }
-            stream.stop();
             tracing::info!("采集工作线程退出");
         })
         .map_err(|e| AudioError::Start(e.to_string()))
+}
+
+fn deliver_chunk<S>(
+    data: &[f32],
+    buf: &mut Vec<f32>,
+    sink: &mut S,
+    probe: Option<&Mutex<ProbeAccum>>,
+) -> Result<(), String>
+where
+    S: FnMut(&[f32]) -> Result<(), String>,
+{
+    if let Some(acc) = probe {
+        acc.lock().unwrap_or_else(|e| e.into_inner()).observe(data);
+    }
+    for &sample in data {
+        buf.push(sample);
+        if buf.len() == CHUNK_SAMPLES {
+            sink(buf)?;
+            buf.clear();
+        }
+    }
+    Ok(())
+}
+
+trait CaptureTail {
+    fn stop_capture(&mut self) -> Result<(), flexaudio::Error>;
+    fn take_chunk(&mut self) -> Option<flexaudio::AudioChunk>;
+    fn take_event(&mut self) -> Option<flexaudio::Event>;
+}
+
+impl CaptureTail for flexaudio::Stream {
+    fn stop_capture(&mut self) -> Result<(), flexaudio::Error> {
+        self.stop_checked()
+    }
+
+    fn take_chunk(&mut self) -> Option<flexaudio::AudioChunk> {
+        self.poll_chunk()
+    }
+
+    fn take_event(&mut self) -> Option<flexaudio::Event> {
+        self.poll_event()
+    }
+}
+
+fn finish_capture<T, S>(
+    stream: &mut T,
+    buf: &mut Vec<f32>,
+    sink: &mut S,
+    probe: Option<&Mutex<ProbeAccum>>,
+    mut failure: Option<String>,
+) -> Option<String>
+where
+    T: CaptureTail,
+    S: FnMut(&[f32]) -> Result<(), String>,
+{
+    if let Err(error) = stream.stop_capture() {
+        if let Some(acc) = probe {
+            acc.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .note_terminal(&error);
+        }
+        tracing::error!("停止音频采集失败：{error}");
+        if failure.is_none() {
+            failure = Some(format!("停止音频采集失败：{error}"));
+        }
+    }
+    while let Some(event) = stream.take_event() {
+        if let Some(acc) = probe {
+            acc.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .note_event(event);
+        }
+    }
+    if failure.is_some() {
+        return failure;
+    }
+
+    // stop_checked 会排出重采样尾块；生产者停止后才能读取完整且有界的尾部。
+    while let Some(chunk) = stream.take_chunk() {
+        if let Err(error) = deliver_chunk(&chunk.data, buf, sink, probe) {
+            return Some(error);
+        }
+    }
+    if !buf.is_empty() {
+        if let Err(error) = sink(buf) {
+            return Some(error);
+        }
+        buf.clear();
+    }
+    None
 }
 
 fn classify_open_error(e: flexaudio::Error) -> AudioError {
@@ -456,6 +535,178 @@ pub fn any_output_active() -> Result<u32, AudioError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    #[derive(Default)]
+    struct FakeCaptureTail {
+        queued: VecDeque<flexaudio::AudioChunk>,
+        on_stop: VecDeque<flexaudio::AudioChunk>,
+        events: VecDeque<flexaudio::Event>,
+        stop_error: Option<flexaudio::Error>,
+        stopped: bool,
+    }
+
+    impl CaptureTail for FakeCaptureTail {
+        fn stop_capture(&mut self) -> Result<(), flexaudio::Error> {
+            self.stopped = true;
+            self.queued.append(&mut self.on_stop);
+            self.stop_error.take().map_or(Ok(()), Err)
+        }
+
+        fn take_chunk(&mut self) -> Option<flexaudio::AudioChunk> {
+            assert!(self.stopped, "必须先停止生产者，再读取尾部");
+            self.queued.pop_front()
+        }
+
+        fn take_event(&mut self) -> Option<flexaudio::Event> {
+            assert!(self.stopped);
+            self.events.pop_front()
+        }
+    }
+
+    fn fake_chunk(value: f32) -> flexaudio::AudioChunk {
+        flexaudio::AudioChunk {
+            data: vec![value; 320],
+            frames: 320,
+            frame_index: 0,
+            pts_ns: 0,
+            seq: 0,
+            flags: flexaudio::ChunkFlags::empty(),
+            dropped_before: 0,
+            peak: value.abs(),
+            rms: value.abs(),
+        }
+    }
+
+    #[test]
+    fn normal_stop_drains_queued_audio_and_resampler_tail_before_the_short_remainder() {
+        let mut stream = FakeCaptureTail {
+            queued: VecDeque::from([fake_chunk(0.2), fake_chunk(0.3)]),
+            on_stop: VecDeque::from([fake_chunk(0.4), fake_chunk(0.5)]),
+            ..Default::default()
+        };
+        let mut buf = vec![0.1; 640];
+        let probe = Mutex::new(ProbeAccum::default());
+        probe.lock().unwrap().observe(&buf);
+        let mut delivered = Vec::new();
+        let failure = finish_capture(
+            &mut stream,
+            &mut buf,
+            &mut |pcm| {
+                delivered.push(pcm.to_vec());
+                Ok(())
+            },
+            Some(&probe),
+            None,
+        );
+
+        assert!(failure.is_none());
+        assert!(stream.stopped && stream.queued.is_empty());
+        assert!(buf.is_empty());
+        assert_eq!(
+            delivered.iter().map(Vec::len).collect::<Vec<_>>(),
+            [1600, 320]
+        );
+        assert_eq!(
+            delivered.concat(),
+            [
+                vec![0.1; 640],
+                vec![0.2; 320],
+                vec![0.3; 320],
+                vec![0.4; 320],
+                vec![0.5; 320]
+            ]
+            .concat()
+        );
+        assert_eq!(probe.lock().unwrap().samples, 1920);
+    }
+
+    #[test]
+    fn capture_failure_stops_the_stream_without_feeding_buffered_audio() {
+        let mut stream = FakeCaptureTail {
+            queued: VecDeque::from([fake_chunk(0.2)]),
+            on_stop: VecDeque::from([fake_chunk(0.3)]),
+            ..Default::default()
+        };
+        let failure = finish_capture(
+            &mut stream,
+            &mut vec![0.1; 640],
+            &mut |_| panic!("采集或推理失败后不得继续输入"),
+            None,
+            Some("语音识别中断".into()),
+        );
+        assert_eq!(failure.as_deref(), Some("语音识别中断"));
+        assert!(stream.stopped);
+        assert_eq!(stream.queued.len(), 2);
+    }
+
+    #[test]
+    fn shutdown_error_is_reported_and_recorded_by_the_probe_without_feeding_audio() {
+        let mut stream = FakeCaptureTail {
+            on_stop: VecDeque::from([fake_chunk(0.3)]),
+            stop_error: Some(flexaudio::Error::PermissionDenied {
+                permission: flexaudio::Permission::SystemAudio,
+                detail: "停止时发现权限被撤销".into(),
+            }),
+            ..Default::default()
+        };
+        let probe = Mutex::new(ProbeAccum::default());
+        let failure = finish_capture(
+            &mut stream,
+            &mut vec![0.1; 640],
+            &mut |_| panic!("停止失败后不得继续输入"),
+            Some(&probe),
+            None,
+        );
+        assert!(failure.unwrap().contains("停止音频采集失败"));
+        let probe = probe.lock().unwrap();
+        assert!(probe.terminal.is_some());
+        assert_eq!(probe.denied_events, 1);
+        assert_eq!(probe.samples, 0);
+    }
+
+    #[test]
+    fn a_sink_failure_while_draining_does_not_feed_more_audio() {
+        let mut stream = FakeCaptureTail {
+            queued: VecDeque::from([fake_chunk(0.2), fake_chunk(0.3)]),
+            ..Default::default()
+        };
+        let mut calls = 0;
+        let failure = finish_capture(
+            &mut stream,
+            &mut vec![0.1; 1280],
+            &mut |_| {
+                calls += 1;
+                Err("尾部识别失败".into())
+            },
+            None,
+            None,
+        );
+        assert_eq!(failure.as_deref(), Some("尾部识别失败"));
+        assert_eq!(calls, 1);
+        assert_eq!(stream.queued.len(), 1);
+    }
+
+    #[test]
+    fn probe_collects_permission_events_emitted_during_stop() {
+        let mut stream = FakeCaptureTail {
+            events: VecDeque::from([flexaudio::Event::PermissionDenied {
+                permission: flexaudio::Permission::SystemAudio,
+                detail: "检测窗口结束时确认拒绝".into(),
+            }]),
+            ..Default::default()
+        };
+        let probe = Mutex::new(ProbeAccum::default());
+        assert!(finish_capture(
+            &mut stream,
+            &mut Vec::new(),
+            &mut |_| Ok(()),
+            Some(&probe),
+            None,
+        )
+        .is_none());
+        assert_eq!(probe.lock().unwrap().denied_events, 1);
+    }
 
     #[test]
     fn source_kind_names_are_stable() {

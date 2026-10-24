@@ -54,20 +54,23 @@ pub fn degenerate_translation(text: &str) -> Option<String> {
     for c in &chars {
         *counts.entry(*c).or_default() += 1;
     }
-    let (top, n) = counts.iter().map(|(c, n)| (*c, *n)).max_by_key(|(_, n)| *n)?;
+    let (top, n) = counts
+        .iter()
+        .map(|(c, n)| (*c, *n))
+        .max_by_key(|(_, n)| *n)?;
     let ratio = n as f32 / chars.len() as f32;
 
-    if n == chars.len() {
+    if !top.is_numeric() && n == chars.len() {
         return Some(format!("整串重复同一字符「{top}」×{n}"));
     }
 
-    if chars.len() >= REPEAT_MIN_LEN && ratio >= REPEAT_RATIO {
+    if !top.is_numeric() && chars.len() >= REPEAT_MIN_LEN && ratio >= REPEAT_RATIO {
         return Some(format!("重复输出：「{top}」占 {:.0}%", ratio * 100.0));
     }
 
     if let Some(last) = chars.last() {
         let trailing = chars.iter().rev().take_while(|c| *c == last).count();
-        if trailing >= TRAILING_RUN {
+        if !last.is_numeric() && trailing >= TRAILING_RUN {
             return Some(format!("尾部重复「{last}」×{trailing}"));
         }
     }
@@ -153,5 +156,38 @@ mod tests {
     #[test]
     fn natural_repetition_in_real_speech_survives() {
         assert!(degenerate_translation("这个真的很重要很重要").is_none());
+    }
+
+    #[test]
+    fn repeated_digits_in_amounts_and_identifiers_are_not_degenerate() {
+        for text in [
+            "100000",
+            "100,000,000",
+            "1,000,000,000,000,000",
+            "10000000 元",
+            "0.000001",
+            "编号 11111111",
+            "验证码 0000",
+            "１２３００００",
+        ] {
+            assert!(
+                degenerate_translation(text).is_none(),
+                "数字中的重复不得丢弃有效译文：{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_content_does_not_hide_real_repetition_loops() {
+        for text in [
+            "金额 100000。。。。",
+            "的的的的的的的的的的的的的的 100000",
+            "100000 来来来来",
+        ] {
+            assert!(
+                degenerate_translation(text).is_some(),
+                "仍需识别数字旁的退化输出：{text}"
+            );
+        }
     }
 }

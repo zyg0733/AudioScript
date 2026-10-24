@@ -387,6 +387,7 @@ pub trait Translator: Send {
 - 队列 MUST 有界，溢出时丢最旧的——用户看到的是实时内容，补上的译文也已经"过期"。
 - 翻译失败 MUST NOT 阻断后续段落，`translationState` 置 `failed` 供 UI 展示。
 - 译文到达 MUST 走 `store` 并重新广播该段落（`revision` 递增），MUST NOT 让前端自己补齐。
+- 新段落原文的广播 MUST 先于翻译入队，保证快速翻译和队列溢出时仍按识别顺序首次显示段落。
 
 **选型：CTranslate2**——`sherpa-onnx` 静态链接 onnxruntime，同一镜像里不能再进第二份 ORT（无上游解法）；CTranslate2 有自己的运行时，与 sherpa 零冲突。
 
@@ -435,7 +436,7 @@ pub trait Translator: Send {
 推理线程（CPU 密集，与采集解耦）
    ↓ 段落（delta）
 TranscriptStore ← 状态机在此
-   ↓ emit（节流 ≥100ms）
+   ↓ emit（按音频块发布；常规 100 ms）
 前端渲染器
 ```
 
@@ -479,6 +480,8 @@ ready ──▶ capturing ──▶ transcribing ──▶ finished
 ```
 
 V0.1 实现到 `capturing`（另有 `error`）。任务状态 MUST 由 Rust 侧持有；托盘图标 MUST 反映后台任务状态。
+
+正常停止 MUST 先停止音频生产者，再读取库内缓冲及重采样尾块，最后冲刷 ASR。已显示的末句即使没有新的识别结果，也 MUST 以同一 `id`、递增 `revision` 定稿；冲刷用的补零 MUST NOT 计入段落时间。停止可取消已有的积压翻译，但 MUST 保留尾部音频新增定稿的翻译，直到采集线程退出后才关闭翻译队列。简繁转换 MUST 对实时与停止定稿使用同一规则。
 
 ### 7.2 后台常驻
 
@@ -533,6 +536,8 @@ V0.1 实现到 `capturing`（另有 `error`）。任务状态 MUST 由 Rust 侧�
 ### 10.1 Markdown 导出
 
 由 `transcript::to_markdown()` 整体生成，落盘到导出目录（默认 `Documents/AudioScript/`，可自定义）：
+
+停止收尾尚未完成时，导出 MUST 明确提示稍后重试，避免写出缺少末句或末句译文的不完整记录。
 
 ```markdown
 # AudioScript 转写记录

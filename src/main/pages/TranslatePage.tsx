@@ -41,9 +41,19 @@ const DIRECTION_OPTIONS = DIRECTIONS.map((d) => ({
 }))
 
 export function TranslatePage() {
-  const { translateEngine, setTranslateEngine, sourceLang, zhScript, setDirection, endpoint, setEndpoint, status } =
-    useStore()
+  const {
+    translateEngine,
+    setTranslateEngine,
+    sourceLang,
+    zhScript,
+    setDirection,
+    endpoint,
+    setEndpoint,
+    status,
+    pending,
+  } = useStore()
   const capturing = status === TaskStatus.Capturing
+  const busy = capturing || pending
 
   const [defaults, setDefaults] = useState<ConfigDefaults | null>(null)
   useEffect(() => {
@@ -70,7 +80,7 @@ export function TranslatePage() {
               value={translateEngine}
               options={translateEngine === TranslateEngine.Mock ? [...ENGINE_OPTIONS, MOCK_OPTION] : ENGINE_OPTIONS}
               onChange={setTranslateEngine}
-              disabled={capturing}
+              disabled={busy}
             />
           }
         />
@@ -87,7 +97,7 @@ export function TranslatePage() {
                 const d = DIRECTIONS.find((d) => directionValue(d.lang, d.script) === v)
                 if (d) setDirection(d.lang, d.script)
               }}
-              disabled={capturing || translateEngine === TranslateEngine.Off}
+              disabled={busy || translateEngine === TranslateEngine.Off}
             />
           }
         />
@@ -110,7 +120,7 @@ export function TranslatePage() {
                 onChange={(v) => setDraft((d) => ({ ...d, trailingSilenceMs: v }))}
                 onCommit={(v) => void setEndpoint({ ...draft, trailingSilenceMs: v })}
                 defaultValue={defaults?.endpoint.trailingSilenceMs}
-                disabled={capturing}
+                disabled={busy}
               />
             </div>
           }
@@ -131,7 +141,7 @@ export function TranslatePage() {
                 onChange={(v) => setDraft((d) => ({ ...d, maxUtteranceMs: v }))}
                 onCommit={(v) => void setEndpoint({ ...draft, maxUtteranceMs: v })}
                 defaultValue={defaults?.endpoint.maxUtteranceMs}
-                disabled={capturing}
+                disabled={busy}
               />
             </div>
           }
@@ -143,7 +153,7 @@ export function TranslatePage() {
             <div className="flex gap-1.5">
               <button
                 type="button"
-                disabled={capturing || !defaults}
+                disabled={busy || !defaults}
                 onClick={() => defaults && void setEndpoint(defaults.endpointProfiles.interpretation)}
                 className="rounded-[var(--radius-ctl)] border border-[var(--color-border-subtle)] px-2 py-1 text-[var(--color-ink-1)] text-xs transition hover:bg-[var(--color-surface-2)] disabled:opacity-40"
               >
@@ -151,7 +161,7 @@ export function TranslatePage() {
               </button>
               <button
                 type="button"
-                disabled={capturing || !defaults}
+                disabled={busy || !defaults}
                 onClick={() => defaults && void setEndpoint(defaults.endpointProfiles.dictation)}
                 className="rounded-[var(--radius-ctl)] border border-[var(--color-border-subtle)] px-2 py-1 text-[var(--color-ink-1)] text-xs transition hover:bg-[var(--color-surface-2)] disabled:opacity-40"
               >

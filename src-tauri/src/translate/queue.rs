@@ -68,13 +68,9 @@ impl JobQueue {
         self.ready.notify_all();
     }
 
-    pub fn close_and_drain(&self) -> Vec<Job> {
+    pub fn drain_pending(&self) -> Vec<Job> {
         let mut g = self.inner.lock().expect("job queue mutex poisoned");
-        g.closed = true;
-        let jobs = g.items.drain(..).collect();
-        drop(g);
-        self.ready.notify_all();
-        jobs
+        g.items.drain(..).collect()
     }
 }
 
@@ -159,13 +155,31 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_returns_jobs_and_prevents_further_consumption() {
-        let queue = JobQueue::new(4);
+    fn cancellation_returns_backlog_but_accepts_final_audio_jobs_until_close() {
+        let queue = JobQueue::new(2);
         queue.push(job("first"));
         queue.push(job("second"));
-        let cancelled = queue.close_and_drain();
+        let cancelled = queue.drain_pending();
         assert_eq!(cancelled, vec![job("first"), job("second")]);
+
+        assert!(queue.push(job("tail-first")).is_none());
+        assert!(queue.push(job("tail-second")).is_none());
+        queue.close();
+        assert_eq!(queue.pop_blocking(), Some(job("tail-first")));
+        assert_eq!(queue.pop_blocking(), Some(job("tail-second")));
         assert!(queue.pop_blocking().is_none());
         assert_eq!(queue.push(job("late")), Some(job("late")));
+    }
+
+    #[test]
+    fn draining_a_closed_queue_does_not_reopen_it() {
+        let queue = JobQueue::new(2);
+        queue.push(job("queued"));
+        queue.close();
+
+        assert_eq!(queue.drain_pending(), vec![job("queued")]);
+        assert!(queue.drain_pending().is_empty());
+        assert_eq!(queue.push(job("late")), Some(job("late")));
+        assert!(queue.pop_blocking().is_none());
     }
 }

@@ -146,6 +146,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [deviceError, setDeviceError] = useState<string | null>(null)
 
   const [overlayCfg, setOverlayCfg] = useState<OverlayConfig | null>(null)
+  const overlayCfgRef = useRef<OverlayConfig | null>(null)
+  const overlayVersion = useRef(0)
+  const overlayQueue = useRef<Promise<void>>(Promise.resolve())
   const [overlayVisible, setOverlayVisible] = useState(false)
 
   const [hotkeys, setHotkeys] = useState<HotkeyInfo[]>([])
@@ -159,6 +162,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
   const pendingRef = useRef(false)
+  const prefsQueue = useRef<Promise<void>>(Promise.resolve())
+  const prefsFailureVersion = useRef(0)
+  const lifetime = useRef({ active: true, version: 0 })
 
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null)
   const [updatePhase, setUpdatePhase] = useState<UpdatePhase>('idle')
@@ -166,6 +172,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [updateError, setUpdateError] = useState<string | null>(null)
   const [installedVersion, setInstalledVersion] = useState<string | null>(null)
   const updateBusyRef = useRef(false)
+
+  useEffect(() => {
+    lifetime.current.active = true
+    return () => {
+      lifetime.current.active = false
+      lifetime.current.version += 1
+    }
+  }, [])
+
+  const applyOverlay = useCallback((config: OverlayConfig) => {
+    overlayVersion.current += 1
+    overlayCfgRef.current = config
+    setOverlayCfg(config)
+  }, [])
 
   useEffect(() => {
     appInfo()
@@ -230,7 +250,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
     on<AudioStatus>(EVENT.audio, setAudio).then(keep).catch(reportError)
 
-    on<OverlayConfig>(EVENT.overlayState, setOverlayCfg).then(keep).catch(reportError)
+    on<OverlayConfig>(EVENT.overlayState, (config) => {
+      if (!disposed) applyOverlay(config)
+    })
+      .then(keep)
+      .catch(reportError)
 
     on<boolean>(EVENT.overlayVisibility, setOverlayVisible).then(keep).catch(reportError)
 
@@ -241,11 +265,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       sessionVersion.current++
       for (const fn of unlisten) fn()
     }
-  }, [])
+  }, [applyOverlay])
 
   useEffect(() => {
+    let disposed = false
     prefsGet()
       .then((p) => {
+        if (disposed) return
         setAudioSource(p.audioSource as AudioSourceKind)
         setTranslateEngine(p.translateEngine)
         setSourceLang(p.sourceLang)
@@ -256,16 +282,30 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setAnalyticsEnabledState(p.analyticsEnabled)
         if (p.deviceId) setDevice(p.deviceId)
       })
-      .catch((e) => setError(`读取设置失败：${formatCmdError(e)}`))
-      .finally(() => setPrefsReady(true))
+      .catch((e) => {
+        if (!disposed) setError(`读取设置失败：${formatCmdError(e)}`)
+      })
+      .finally(() => {
+        if (!disposed) setPrefsReady(true)
+      })
 
+    const version = overlayVersion.current
     overlayConfigGet()
-      .then(setOverlayCfg)
-      .catch(() => {})
+      .then((config) => {
+        if (!disposed && config && version === overlayVersion.current) applyOverlay(config)
+      })
+      .catch((e) => {
+        if (!disposed) setError(`读取悬浮窗配置失败：${formatCmdError(e)}`)
+      })
     overlayIsVisible()
-      .then(setOverlayVisible)
+      .then((visible) => {
+        if (!disposed) setOverlayVisible(visible)
+      })
       .catch(() => {})
-  }, [])
+    return () => {
+      disposed = true
+    }
+  }, [applyOverlay])
 
   useEffect(() => {
     setTrackingEnabled(prefsReady && analyticsEnabled && info?.analyticsAvailable === true)
@@ -304,25 +344,57 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     return () => mq.removeEventListener('change', onChange)
   }, [theme, applyTheme])
 
-  const patchPrefs = useCallback(async (patch: PrefsPatch) => {
-    try {
-      const p = await prefsSet(patch)
-      if (patch.theme !== undefined) setTheme(p.theme)
-      if (patch.endpoint !== undefined) setEndpoint(p.endpoint)
-    } catch (e) {
-      setError(formatCmdError(e))
-    }
+  const savePrefs = useCallback((patch: PrefsPatch) => {
+    const version = lifetime.current.version
+    const request = prefsQueue.current.then(async () => {
+      if (!lifetime.current.active || version !== lifetime.current.version) return null
+      try {
+        const saved = await prefsSet(patch)
+        return lifetime.current.active && version === lifetime.current.version ? saved : null
+      } catch (error) {
+        if (!lifetime.current.active || version !== lifetime.current.version) return null
+        throw error
+      }
+    })
+    prefsQueue.current = request.then(
+      () => {},
+      () => {
+        prefsFailureVersion.current += 1
+      },
+    )
+    return request
   }, [])
+
+  const patchPrefs = useCallback(
+    async (patch: PrefsPatch) => {
+      try {
+        const p = await savePrefs(patch)
+        if (!p) return false
+        if (patch.audioSource !== undefined) setAudioSource(p.audioSource as AudioSourceKind)
+        if (patch.deviceId !== undefined) setDevice(p.deviceId ?? '')
+        if (patch.translateEngine !== undefined) setTranslateEngine(p.translateEngine)
+        if (patch.sourceLang !== undefined) setSourceLang(p.sourceLang)
+        if (patch.zhScript !== undefined) setZhScript(p.zhScript)
+        if (patch.theme !== undefined) setTheme(p.theme)
+        if (patch.endpoint !== undefined) setEndpoint(p.endpoint)
+        return true
+      } catch (e) {
+        if (patch.endpoint !== undefined) setEndpoint((current) => ({ ...current }))
+        setError(formatCmdError(e))
+        return false
+      }
+    },
+    [savePrefs],
+  )
 
   const completeOnboarding = useCallback(async () => {
     setOnboardingDone(true)
     try {
-      await prefsSet({ onboardingDone: true })
-      track('onboarding_completed')
+      if (await savePrefs({ onboardingDone: true })) track('onboarding_completed')
     } catch (e) {
       setError(formatCmdError(e))
     }
-  }, [])
+  }, [savePrefs])
 
   const setAnalyticsEnabled = useCallback(
     (next: boolean) => {
@@ -330,15 +402,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setError(info?.analyticsDisabledReason ?? '此构建未配置匿名统计')
         return
       }
-      void prefsSet({ analyticsEnabled: next })
+      void savePrefs({ analyticsEnabled: next })
         .then((p) => {
+          if (!p) return
           setAnalyticsEnabledState(p.analyticsEnabled)
           setTrackingEnabled(p.analyticsEnabled && info?.analyticsAvailable === true)
           if (p.analyticsEnabled) track('setting_changed', { key: 'analytics', value: 'on' })
         })
         .catch((e) => setError(formatCmdError(e)))
     },
-    [info],
+    [info, savePrefs],
   )
 
   const refreshDevices = useCallback(async () => {
@@ -367,8 +440,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (status === TaskStatus.Capturing) {
         await withTimeout(sessionStop(), STOP_TIMEOUT_MS, '停止请求超时：请重试，或使用托盘「停止转写」')
       } else {
+        const lifetimeVersion = lifetime.current.version
+        const failureVersion = prefsFailureVersion.current
+        await prefsQueue.current
+        if (!lifetime.current.active || lifetimeVersion !== lifetime.current.version) return
+        if (failureVersion !== prefsFailureVersion.current) return
+        const saved = await prefsGet()
         await withTimeout(
-          sessionStart(device || undefined, translateEngine, sourceLang, zhScript, audioSource),
+          sessionStart(
+            saved.deviceId || undefined,
+            saved.translateEngine,
+            saved.sourceLang,
+            saved.zhScript,
+            saved.audioSource as AudioSourceKind,
+          ),
           START_TIMEOUT_MS,
           '开始转写超时，请重试',
         )
@@ -403,22 +488,34 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       pendingRef.current = false
       setPending(false)
     }
-  }, [status, device, translateEngine, sourceLang, zhScript, audioSource, refreshPermission])
+  }, [status, refreshPermission])
 
   const clearAll = useCallback(async () => {
     await sessionClear()
   }, [])
 
   const updateOverlay = useCallback(
-    async (patch: Partial<OverlayConfig>) => {
-      if (!overlayCfg) return
-      try {
-        setOverlayCfg(await overlayConfigSet({ ...overlayCfg, ...patch }))
-      } catch (e) {
-        setError(formatCmdError(e))
-      }
+    (patch: Partial<OverlayConfig>) => {
+      const lifetimeVersion = lifetime.current.version
+      const request = overlayQueue.current.then(async () => {
+        if (!lifetime.current.active || lifetimeVersion !== lifetime.current.version) return
+        const current = overlayCfgRef.current
+        if (!current) return
+        const version = overlayVersion.current
+        try {
+          const saved = await overlayConfigSet({ ...current, ...patch })
+          if (!lifetime.current.active || lifetimeVersion !== lifetime.current.version) return
+          if (version === overlayVersion.current) applyOverlay(saved)
+        } catch (e) {
+          if (!lifetime.current.active || lifetimeVersion !== lifetime.current.version) return
+          setOverlayCfg((config) => config && { ...config })
+          setError(formatCmdError(e))
+        }
+      })
+      overlayQueue.current = request
+      return request
     },
-    [overlayCfg],
+    [applyOverlay],
   )
 
   const toggleOverlay = useCallback(async () => {
@@ -440,26 +537,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const changeTheme = useCallback(
     async (next: Theme) => {
-      setTheme(next)
-      await patchPrefs({ theme: next })
-      track('setting_changed', { key: 'theme', value: next })
+      if (await patchPrefs({ theme: next })) track('setting_changed', { key: 'theme', value: next })
     },
     [patchPrefs],
   )
 
   const changeAudioSource = useCallback(
     (v: AudioSourceKind) => {
-      setAudioSource(v)
-      setDevice('')
-      void patchPrefs({ audioSource: v, deviceId: '' })
-      track('setting_changed', { key: 'audio_source', value: v })
+      void patchPrefs({ audioSource: v, deviceId: '' }).then((saved) => {
+        if (saved) track('setting_changed', { key: 'audio_source', value: v })
+      })
     },
     [patchPrefs],
   )
 
   const changeDevice = useCallback(
     (v: string) => {
-      setDevice(v)
       void patchPrefs({ deviceId: v })
     },
     [patchPrefs],
@@ -467,26 +560,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const changeTranslateEngine = useCallback(
     (v: TranslateEngine) => {
-      setTranslateEngine(v)
-      void patchPrefs({ translateEngine: v })
-      track('setting_changed', { key: 'translate_engine', value: v })
+      void patchPrefs({ translateEngine: v }).then((saved) => {
+        if (saved) track('setting_changed', { key: 'translate_engine', value: v })
+      })
     },
     [patchPrefs],
   )
 
   const changeDirection = useCallback(
     (lang: string, script: ZhScript) => {
-      setSourceLang(lang)
-      setZhScript(script)
-      void patchPrefs({ sourceLang: lang, zhScript: script })
-      track('setting_changed', { key: 'translate_direction', value: `${lang}:${script}` })
+      void patchPrefs({ sourceLang: lang, zhScript: script }).then((saved) => {
+        if (saved) track('setting_changed', { key: 'translate_direction', value: `${lang}:${script}` })
+      })
     },
     [patchPrefs],
   )
 
   const changeEndpoint = useCallback(
     async (v: EndpointConfig) => {
-      setEndpoint(v)
       await patchPrefs({ endpoint: v })
     },
     [patchPrefs],

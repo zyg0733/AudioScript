@@ -24,8 +24,18 @@ const SOURCE_OPTIONS = [
 ]
 
 export function AudioPage({ onOpenPermissions }: { onOpenPermissions: () => void }) {
-  const { audioSource, setAudioSource, devices, device, setDevice, deviceError, refreshDevices, audio, status } =
-    useStore()
+  const {
+    audioSource,
+    setAudioSource,
+    devices,
+    device,
+    setDevice,
+    deviceError,
+    refreshDevices,
+    audio,
+    status,
+    pending,
+  } = useStore()
 
   const capturing = status === TaskStatus.Capturing
   const selected = devices.find((d) => d.id === device)
@@ -58,7 +68,7 @@ export function AudioPage({ onOpenPermissions }: { onOpenPermissions: () => void
               title={o.label}
               description={o.description}
               selected={audioSource === o.value}
-              disabled={capturing}
+              disabled={capturing || pending}
               onSelect={() => setAudioSource(o.value)}
             />
           ))}
@@ -90,7 +100,7 @@ export function AudioPage({ onOpenPermissions }: { onOpenPermissions: () => void
                       }))
                 }
                 onChange={setDevice}
-                disabled={capturing}
+                disabled={capturing || pending}
                 className="max-w-[13rem]"
               />
               <Button icon="refresh" size="sm" onClick={() => void refreshDevices()}>

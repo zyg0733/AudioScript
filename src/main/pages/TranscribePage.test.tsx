@@ -8,6 +8,9 @@ const mocks = vi.hoisted(() => ({
   clearAll: vi.fn(),
   localClear: vi.fn(),
   setError: vi.fn(),
+  save: vi.fn(),
+  revealPath: vi.fn(),
+  transcriptExport: vi.fn(),
   segments: [] as TranscriptSegment[],
   streamError: null as string | null,
 }))
@@ -22,11 +25,11 @@ vi.mock('@/shared/useTranscriptStream', () => ({
 
 vi.mock('@/shared/ipc', async () => ({
   ...(await vi.importActual<typeof import('@/shared/ipc')>('@/shared/ipc')),
-  revealPath: vi.fn(),
-  transcriptExport: vi.fn(),
+  revealPath: mocks.revealPath,
+  transcriptExport: mocks.transcriptExport,
 }))
 
-vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }))
+vi.mock('@tauri-apps/plugin-dialog', () => ({ save: mocks.save }))
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
 
@@ -48,6 +51,9 @@ describe('TranscribePage clear and stream failures', () => {
     mocks.clearAll.mockReset()
     mocks.localClear.mockReset()
     mocks.setError.mockReset()
+    mocks.save.mockReset()
+    mocks.revealPath.mockReset()
+    mocks.transcriptExport.mockReset()
     mocks.streamError = null
     mocks.segments = [
       {
@@ -105,6 +111,18 @@ describe('TranscribePage clear and stream failures', () => {
     const alert = container.querySelector('[role="alert"]')
     expect(alert?.textContent).toContain('转写内容同步失败')
     expect(alert?.textContent).toContain('字幕订阅失败：监听不可用')
+    expect(container.textContent).toContain('需要保留的转写')
+  })
+
+  it('reports an export rejected during teardown and does not reveal an unfinished file', async () => {
+    mocks.save.mockResolvedValue('/tmp/transcript.md')
+    mocks.transcriptExport.mockRejectedValue(new Error('会话仍在收尾，请稍后再导出'))
+    await render()
+    const button = Array.from(container.querySelectorAll('button')).find((item) => item.textContent?.trim() === '导出')
+    if (!button) throw new Error('导出按钮未找到')
+    await act(async () => button.click())
+    expect(mocks.setError).toHaveBeenCalledWith(expect.stringContaining('会话仍在收尾'))
+    expect(mocks.revealPath).not.toHaveBeenCalled()
     expect(container.textContent).toContain('需要保留的转写')
   })
 })

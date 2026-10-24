@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useStore } from '@/main/store'
-import { formatCmdError, type OverlayConfig, overlaySetMode, shortcutsSet } from '@/shared/ipc'
+import { formatCmdError, type OverlayConfig, shortcutsSet } from '@/shared/ipc'
 import { isMacOS } from '@/shared/platform'
 import { MAX_FONT_SIZE, MAX_OVERLAY_LINES, MIN_FONT_SIZE, OverlayMode } from '@/shared/types'
 import { Button } from '@/ui/Button'
@@ -58,7 +58,7 @@ export function OverlayPage() {
                 { value: OverlayMode.Locked, label: '锁定（穿透）' },
                 { value: OverlayMode.Edit, label: '编辑' },
               ]}
-              onChange={(v) => void overlaySetMode(v)}
+              onChange={(v) => void updateOverlay({ mode: v })}
             />
           }
         />
