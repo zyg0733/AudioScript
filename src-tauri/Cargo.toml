@@ -1,6 +1,6 @@
 [package]
 name = "audioscript"
-version = "0.2.11"
+version = "0.2.12"
 description = "AudioScript 声稿 — 离线优先语音转写，带悬浮流式字幕窗"
 authors = ["Nico"]
 license = "MIT"
@@ -130,3 +130,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
+
+[dev-dependencies]
+base64 = "0.22"
+minisign-verify = "0.3"
+semver = "1"

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { verifyReleaseVersion } from './verify-release-version.mjs'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -11,6 +12,7 @@ const FILES = [
   'src-tauri/Cargo.toml',
   'src-tauri/tauri.conf.json',
   'src-tauri/Cargo.lock',
+  'docs/index.html',
 ]
 
 function git(args) {
@@ -58,10 +60,6 @@ function write(rel, text) {
   writeFileSync(join(ROOT, rel), text)
 }
 
-function readJsonVersion(rel) {
-  return JSON.parse(read(rel)).version
-}
-
 const TOP_LEVEL_VERSION = /^(  "version": ")[^"]*(")/m
 
 function bumpJsonVersion(rel, version) {
@@ -89,6 +87,10 @@ function rewrite(version) {
     fail('Cargo.lock 里没找到 audioscript 的版本条目')
   }
   write('src-tauri/Cargo.lock', updated)
+  const site = read('docs/index.html')
+  const updatedSite = site.replace(/("softwareVersion"\s*:\s*")[^"]*(")/, `$1${version}$2`)
+  if (updatedSite === site) fail('官网缺少 softwareVersion 字段')
+  write('docs/index.html', updatedSite)
 }
 
 function main() {
@@ -108,10 +110,7 @@ function main() {
     fail(`当前在 ${branch}，发布必须在 main 上`)
   }
 
-  const current = readJsonVersion('package.json')
-  if (readJsonVersion('src-tauri/tauri.conf.json') !== current) {
-    fail(`package.json 与 tauri.conf.json 的版本号已经不一致（${current}）`)
-  }
+  const current = verifyReleaseVersion(ROOT)
 
   const version = raw.replace(/^v/, '')
   const isBump = ['patch', 'minor', 'major'].includes(version)
@@ -128,6 +127,12 @@ function main() {
   if (git(['tag', '-l', tag])) {
     fail(`tag ${tag} 已存在`)
   }
+  try {
+    const remote = git(['ls-remote', '--exit-code', '--tags', 'origin', `refs/tags/${tag}`])
+    if (remote) fail(`远端 tag ${tag} 已存在，禁止覆盖已发布版本`)
+  } catch (error) {
+    if (error.status !== 2) fail('无法确认远端标签状态，停止发布')
+  }
 
   const rewriting = next !== current
 
@@ -135,6 +140,7 @@ function main() {
     process.stdout.write(`\n🚀 发布 ${current} → ${next}\n\n`)
     process.stdout.write('📝 改写版本号…\n')
     rewrite(next)
+    verifyReleaseVersion(ROOT, tag)
     for (const f of FILES) {
       process.stdout.write(`   ${f}\n`)
     }
@@ -171,4 +177,4 @@ function main() {
   process.stdout.write(`   ${remote}/releases/tag/${tag}\n\n`)
 }
 
-main()
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main()

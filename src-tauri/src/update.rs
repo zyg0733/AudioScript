@@ -111,13 +111,14 @@ pub async fn install(app: &AppHandle) -> Result<String, String> {
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| format!("更新组件未就绪：{e}"))?;
-    let Some(update) = updater
+    let Some(mut update) = updater
         .check()
         .await
         .map_err(|e| format!("检查更新失败：{e}"))?
     else {
         return Err("已是最新版本，无需更新".into());
     };
+    update.timeout = Some(std::time::Duration::from_secs(300));
 
     let version = update.version.clone();
     tracing::info!(version = %version, "开始下载更新");

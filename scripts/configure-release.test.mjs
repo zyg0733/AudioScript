@@ -63,6 +63,7 @@ test('自有签名配置只将公钥写入更新配置，不持久化或输出�
   const config = JSON.parse(raw)
   assert.equal(config.bundle.createUpdaterArtifacts, true)
   assert.equal(config.plugins.updater.pubkey, publicKey)
+  assert.equal(config.plugins.updater.requireSignedVersion, true)
   assert.deepEqual(config.plugins.updater.endpoints, [links.updaterEndpoint])
   assert.equal(`${raw}${result.stdout}${result.stderr}`.includes(privateFixture), false)
   assert.equal(readFileSync(join(result.dir, 'github-output'), 'utf8'), 'updater_enabled=true\n')
@@ -103,4 +104,12 @@ test('工作流显式选择签名更新模式时缺配置必须失败', (t) => {
   const result = run(t, { AUDIOSCRIPT_RELEASE_MODE: 'signed-updater' })
   assert.notEqual(result.status, 0)
   assert.equal(existsSync(result.output), false)
+})
+
+test('公钥含额外字符或附加内容时不能通过宽松 base64 解码绕过格式检查', (t) => {
+  for (const key of [publicKey + '!', Buffer.from(Buffer.from(publicKey, 'base64').toString() + 'extra\n').toString('base64')]) {
+    const result = run(t, { TAURI_UPDATER_PUBLIC_KEY: key, TAURI_SIGNING_PRIVATE_KEY: privateFixture })
+    assert.notEqual(result.status, 0)
+    assert.equal(existsSync(result.output), false)
+  }
 })

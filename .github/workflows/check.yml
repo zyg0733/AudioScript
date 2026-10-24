@@ -38,7 +38,9 @@ jobs:
       - name: Validate model catalog
         run: pnpm verify:models
       - name: Validate fork identity and release endpoints
-        run: pnpm verify:project
+        run: |
+          pnpm verify:project
+          node scripts/verify-release-version.mjs
       - name: Build both frontend windows
         run: pnpm build:frontend
       - name: Check frontend entrypoints
@@ -69,4 +71,4 @@ jobs:
           typeshare src-tauri --lang=typescript --output-file=src/shared/types.ts
           git diff --exit-code -- src/shared/types.ts
       - name: Rust regression tests
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --example model_smoke
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --example model_smoke --example updater_verify
