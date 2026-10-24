@@ -14,6 +14,7 @@ assert.equal(project.modelsRelease, `${project.repository}/releases/download/mod
 assert.deepEqual(config.plugins.updater.endpoints, [project.updaterEndpoint], '更新地址必须与 project.json 一致')
 assert.equal(config.plugins.updater.pubkey, '', '源码不得内置上游或其他更新公钥，发布时注入自有公钥')
 assert.equal(config.bundle.createUpdaterArtifacts, false, '普通构建默认不生成更新工件')
+assert.equal(config.plugins.updater.requireSignedVersion, true, '更新签名必须绑定清单版本')
 assert.equal(config.identifier, 'io.github.zyg0733.audioscript', 'fork 应用标识不能与上游共用')
 assert.equal(catalog.models.find((model) => model.id === 'mt-big').archive.url.startsWith(`${project.modelsRelease}/`), true)
 

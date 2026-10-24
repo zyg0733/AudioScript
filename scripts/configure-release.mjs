@@ -26,7 +26,7 @@ if (installersOnly && required) {
 if (publicKey && !installersOnly) {
   const text = Buffer.from(publicKey, 'base64').toString('utf8').trim().split(/\r?\n/)
   const bytes = Buffer.from(text[1] ?? '', 'base64')
-  if (!text[0]?.startsWith('untrusted comment:') || bytes.length !== 42 || !['Ed', 'ED'].includes(bytes.subarray(0, 2).toString())) {
+  if (Buffer.from(publicKey, 'base64').toString('base64') !== publicKey || text.length !== 2 || !text[0]?.startsWith('untrusted comment:') || bytes.length !== 42 || !['Ed', 'ED'].includes(bytes.subarray(0, 2).toString())) {
     fail('TAURI_UPDATER_PUBLIC_KEY 必须是本项目 Tauri signer 生成的完整公钥文件内容（base64 格式）')
   }
 }
@@ -41,7 +41,7 @@ const output = resolve(root, outputFlag >= 0 ? process.argv[outputFlag + 1] : '.
 mkdirSync(dirname(output), { recursive: true })
 writeFileSync(output, `${JSON.stringify({
   bundle: { createUpdaterArtifacts: enabled },
-  plugins: { updater: { pubkey: installersOnly ? '' : publicKey, endpoints: [project.updaterEndpoint] } },
+  plugins: { updater: { pubkey: installersOnly ? '' : publicKey, endpoints: [project.updaterEndpoint], requireSignedVersion: true } },
 }, null, 2)}\n`)
 
 if (process.env.GITHUB_OUTPUT) {

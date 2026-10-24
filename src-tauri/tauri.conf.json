@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "AudioScript",
-  "version": "0.2.11",
+  "version": "0.2.12",
   "identifier": "io.github.zyg0733.audioscript",
   "build": {
     "frontendDist": "../dist",
@@ -52,7 +52,8 @@
   "plugins": {
     "updater": {
       "endpoints": ["https://github.com/zyg0733/AudioScript/releases/latest/download/latest.json"],
-      "pubkey": ""
+      "pubkey": "",
+      "requireSignedVersion": true
     }
   },
   "bundle": {

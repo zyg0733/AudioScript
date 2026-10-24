@@ -330,9 +330,10 @@ dependencies = [
 
 [[package]]
 name = "audioscript"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "block2",
  "bzip2 0.5.2",
  "ct2rs",
@@ -341,8 +342,10 @@ dependencies = [
  "flexaudio",
  "flexaudio-os-macos",
  "libc",
+ "minisign-verify",
  "objc2",
  "objc2-foundation",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

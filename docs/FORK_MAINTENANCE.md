@@ -33,6 +33,23 @@
 
 配置自有密钥后，手动选择 `signed-updater` 验证签名工件；`v*` tag 推送仍强制要求自有密钥，不能用 `installers-only` 绕过。此签名发布路径汇总各平台签名到 `latest.json`，仅上传到本仓库 Releases。发布后用上一版本安装包验证：检查更新、签名校验、安装、重启和配置保留；没有通过这条流程前不要宣布自动更新可用。
 
+首个带更新公钥的版本为 `0.2.12`。已公开的 `0.2.11` 在编译时关闭了更新插件，补上传 `latest.json` 或修改仓库变量都不能改变已安装程序；用户必须手动安装首个带公钥的新版，此后才可使用其更新功能。不得覆盖 `v0.2.11` 的既有安装包，或重新运行该标签旧版工作流来补签名。
+
+密钥由维护者生成和备份，代理遵守 `CLAUDE.md` 对私钥的约束；不能把私钥或密码粘贴到聊天。维护者可以在自己的终端按官方 CLI 交互生成密码保护的密钥，再将文件直接通过标准输入提交到本仓库：
+
+```bash
+pnpm tauri signer generate -w "$HOME/.tauri/AudioScript/updater.key"
+gh secret set TAURI_SIGNING_PRIVATE_KEY --repo zyg0733/AudioScript < "$HOME/.tauri/AudioScript/updater.key"
+gh variable set TAURI_UPDATER_PUBLIC_KEY --repo zyg0733/AudioScript < "$HOME/.tauri/AudioScript/updater.key.pub"
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --repo zyg0733/AudioScript
+```
+
+最后一个命令交互输入所设置的密钥密码。私钥文件及密码必须另行安全备份，不进入源码、日志或发布附件。已经存在自有公钥或私钥时，应使用原配对密钥；不得自动轮换已受客户端信任的更新公钥。
+
+签名 CI 会先签随机挑战文件并通过独立 `minisign` 验证公私钥及密码，再构建安装包。每个平台对实际更新包验证完整签名和签名内的版本，并要求篡改包、错误公钥、错误清单版本三个反例全部被拒绝。`requireSignedVersion` 在客户端强制签名版本与清单版本一致。所有原有解包、模型文件、真实 ASR/翻译和启动预算检查继续执行。
+
+`signed-updater` 手动运行也会汇总八个平台别名，完整验签五个唯一更新包，核对安装器和报告，产出 `verified-release` 工件，但不公开发布。标签发布则从这一已验证工件创建草稿，逐个比对 GitHub 上传摘要，再公开；同名公开版本或草稿均拒绝覆盖。标签、package、Cargo 两处、Tauri 配置及官网版本必须一致。
+
 本地需要验证签名构建时，在受控环境中设置上述环境变量，运行 `node scripts/configure-release.mjs --require-updater`，然后运行 `pnpm tauri build --config .cache/tauri-release.conf.json`。不要通过命令行参数传私钥。
 
 官方参考：[Tauri 更新与签名说明](https://v2.tauri.app/plugin/updater/)、[更新插件公钥配置](https://docs.rs/tauri-plugin-updater/2.14.0/tauri_plugin_updater/struct.Builder.html#method.pubkey)。
@@ -62,6 +79,8 @@ pnpm verify:project
 pnpm verify:models
 pnpm build:frontend
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+cargo test --locked --manifest-path src-tauri/Cargo.toml --example updater_verify
+node scripts/verify-release-version.mjs
 ```
 
 Rust 测试仍需下载锁定的 crates 和原生推理库，但回归测试不依赖真实麦克风、系统权限或模型权重。生成类型必须使用 typeshare-cli 1.13.4：运行 `pnpm gen:types` 后检查 `src/shared/types.ts` 的差异，禁止手工维护该文件。
