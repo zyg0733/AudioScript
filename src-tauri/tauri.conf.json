@@ -58,7 +58,7 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": false,
-    "macOS": { "minimumSystemVersion": "14.2" },
+    "macOS": { "minimumSystemVersion": "14.2", "signingIdentity": "-" },
     "targets": "all",
     "icon": [
       "icons/32x32.png",

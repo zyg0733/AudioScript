@@ -119,10 +119,11 @@ export async function verifyModelCopies(modelsRoot, expected) {
   }
 }
 
-function run(command, args, options = {}) {
+export function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: 'utf8', timeout: 180_000, ...options })
-  if (result.error) throw new Error(`无法执行 ${command}：${result.error.message}`)
-  assert.ok((options.allowedStatuses ?? [0]).includes(result.status), `${command} 验证失败（${result.status}）：${result.stderr || result.stdout}`)
+  const output = [result.stdout, result.stderr].filter(Boolean).join('\n')
+  if (result.error) throw new Error(`无法执行 ${command}：${result.error.message}\n${output}`)
+  assert.ok((options.allowedStatuses ?? [0]).includes(result.status), `${command} 验证失败（${result.status}）：${output}`)
   return result.stdout
 }
 
@@ -150,6 +151,17 @@ export function verifyLddResult(result) {
   assert.ok(!/\bnot found\b/i.test(output), `Linux 安装包缺少动态依赖：${output}`)
   assert.ok(result.status === 0 || (result.status === 1 && /not a dynamic executable|statically linked/i.test(output)), `ldd 验证失败：${output}`)
   return output
+}
+
+export function runModelSmoke(executable, { platform, modelsRoot, wav }, execute = run) {
+  const args = ['--models-root', modelsRoot, ...wav ? ['--wav', wav] : []]
+  const modes = [{ mode: 'default', env: process.env }]
+  if (platform !== 'macos-arm64') modes.push({ mode: 'mkl-disabled', env: { ...process.env, CT2_USE_MKL: '0' } })
+  return modes.map(({ mode, env }) => {
+    const output = execute(executable, args, { env }).trim()
+    process.stdout.write(`模型 smoke (${platform}, ${mode})：\n${output}\n`)
+    return { mode, output }
+  })
 }
 
 export async function verifyExtracted({ root, platform, config, expected, smokeExecutable, smokeWav }) {
@@ -183,12 +195,13 @@ export async function verifyExtracted({ root, platform, config, expected, smokeE
   await verifyModelCopies(modelsRoot, expected)
   let smoke = 'not requested'
   let smokeOutput = ''
+  let smokeRuns = []
   if (smokeExecutable) {
-    smokeOutput = run(smokeExecutable, ['--models-root', modelsRoot, ...smokeWav ? ['--wav', smokeWav] : []]).trim()
-    process.stdout.write(`模型 smoke (${platform})：\n${smokeOutput}\n`)
+    smokeRuns = runModelSmoke(smokeExecutable, { platform, modelsRoot, wav: smokeWav })
+    smokeOutput = smokeRuns.map(({ mode, output }) => `[${mode}]\n${output}`).join('\n')
     smoke = 'passed'
   }
-  return { installedExecutable: executable, resourcesRoot: dirname(modelsRoot), format, ...metadata, modelFiles: expected.length, smoke, smokeOutput }
+  return { installedExecutable: executable, resourcesRoot: dirname(modelsRoot), format, ...metadata, modelFiles: expected.length, smoke, smokeOutput, smokeRuns }
 }
 
 async function verifyInstaller(installer, platform, config, expected, smokeExecutable, smokeWav) {
