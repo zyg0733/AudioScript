@@ -11,6 +11,12 @@ pub(super) enum Failure<T> {
     Accepted(Option<T>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExclusiveOperation {
+    Update,
+    Restart,
+}
+
 pub(super) struct Lifecycle<T> {
     next_epoch: u64,
     active_epoch: Option<u64>,
@@ -18,6 +24,7 @@ pub(super) struct Lifecycle<T> {
     running: Option<T>,
     status: Status,
     error: Option<String>,
+    exclusive_operation: Option<ExclusiveOperation>,
 }
 
 impl<T> Default for Lifecycle<T> {
@@ -29,12 +36,20 @@ impl<T> Default for Lifecycle<T> {
             running: None,
             status: Status::Ready,
             error: None,
+            exclusive_operation: None,
         }
     }
 }
 
 impl<T> Lifecycle<T> {
     pub(super) fn begin(&mut self) -> Result<u64, &'static str> {
+        match self.exclusive_operation {
+            Some(ExclusiveOperation::Update) => {
+                return Err("正在下载或安装更新，无法开始转写");
+            }
+            Some(ExclusiveOperation::Restart) => return Err("应用正在重启，无法开始转写"),
+            None => {}
+        }
         if self.active_epoch.is_some() || self.initializing_epoch.is_some() {
             return Err("会话正在启动或采集中");
         }
@@ -44,6 +59,35 @@ impl<T> Lifecycle<T> {
         self.status = Status::Ready;
         self.error = None;
         Ok(self.next_epoch)
+    }
+
+    pub(super) fn reserve_exclusive(
+        &mut self,
+        operation: ExclusiveOperation,
+        teardown_active: bool,
+    ) -> Result<(), &'static str> {
+        match self.exclusive_operation {
+            Some(ExclusiveOperation::Update) => return Err("正在下载或安装更新，请稍候"),
+            Some(ExclusiveOperation::Restart) => return Err("应用正在重启，请稍候"),
+            None => {}
+        }
+        if self.initializing_epoch.is_some() {
+            return Err("会话仍在启动，请等待启动结束后再更新或重启");
+        }
+        if self.active_epoch.is_some() {
+            return Err("请先停止转写，再安装更新或重启");
+        }
+        if teardown_active {
+            return Err("会话仍在收尾，请等待转写和翻译完成后再更新或重启");
+        }
+        self.exclusive_operation = Some(operation);
+        Ok(())
+    }
+
+    pub(super) fn release_exclusive(&mut self, operation: ExclusiveOperation) {
+        if self.exclusive_operation == Some(operation) {
+            self.exclusive_operation = None;
+        }
     }
 
     pub(super) fn publish(&mut self, epoch: u64, running: T) -> Result<(), T> {
@@ -197,5 +241,98 @@ mod tests {
         state.stop();
         assert!(state.ensure_clearable(true).is_err());
         assert!(state.ensure_clearable(false).is_ok());
+    }
+
+    #[test]
+    fn update_and_restart_reject_starting_capturing_and_unfinished_teardown() {
+        for operation in [ExclusiveOperation::Update, ExclusiveOperation::Restart] {
+            let mut state = Lifecycle::default();
+            let epoch = state.begin().unwrap();
+            assert!(state.reserve_exclusive(operation, false).is_err());
+            state.publish(epoch, "采集资源").unwrap();
+            assert!(state.reserve_exclusive(operation, false).is_err());
+            assert_eq!(state.stop(), Some("采集资源"));
+            assert_eq!(state.status(), Status::Ready);
+            assert!(state.reserve_exclusive(operation, true).is_err());
+            assert!(state.reserve_exclusive(operation, false).is_ok());
+        }
+    }
+
+    #[test]
+    fn cancelling_a_start_does_not_allow_updates_until_initialization_exits() {
+        let mut state = Lifecycle::<()>::default();
+        let epoch = state.begin().unwrap();
+        state.stop();
+        assert!(state
+            .reserve_exclusive(ExclusiveOperation::Update, false)
+            .is_err());
+        assert!(state
+            .reserve_exclusive(ExclusiveOperation::Restart, false)
+            .is_err());
+        state.abort_start(epoch);
+        assert!(state
+            .reserve_exclusive(ExclusiveOperation::Update, false)
+            .is_ok());
+    }
+
+    #[test]
+    fn update_and_restart_reservations_block_every_later_start() {
+        for operation in [ExclusiveOperation::Update, ExclusiveOperation::Restart] {
+            let mut state = Lifecycle::<()>::default();
+            state.reserve_exclusive(operation, false).unwrap();
+            assert!(state.begin().is_err());
+            assert!(state
+                .reserve_exclusive(ExclusiveOperation::Update, false)
+                .is_err());
+            assert!(state
+                .reserve_exclusive(ExclusiveOperation::Restart, false)
+                .is_err());
+            state.stop();
+            assert!(state.begin().is_err());
+            state.release_exclusive(operation);
+            assert!(state.begin().is_ok());
+        }
+    }
+
+    #[test]
+    fn simultaneous_session_and_update_requests_have_only_one_winner() {
+        use std::sync::{Arc, Barrier, Mutex};
+
+        for _ in 0..32 {
+            let state = Arc::new(Mutex::new(Lifecycle::<()>::default()));
+            let ready = Arc::new(Barrier::new(3));
+            let attempted = Arc::new(Barrier::new(3));
+            let threads: Vec<_> = [false, true]
+                .into_iter()
+                .map(|update| {
+                    let state = state.clone();
+                    let ready = ready.clone();
+                    let attempted = attempted.clone();
+                    std::thread::spawn(move || {
+                        ready.wait();
+                        let accepted = {
+                            let mut lifecycle = state.lock().unwrap();
+                            if update {
+                                lifecycle
+                                    .reserve_exclusive(ExclusiveOperation::Update, false)
+                                    .is_ok()
+                            } else {
+                                lifecycle.begin().is_ok()
+                            }
+                        };
+                        attempted.wait();
+                        accepted
+                    })
+                })
+                .collect();
+            ready.wait();
+            attempted.wait();
+            let accepted = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .filter(|accepted| *accepted)
+                .count();
+            assert_eq!(accepted, 1);
+        }
     }
 }

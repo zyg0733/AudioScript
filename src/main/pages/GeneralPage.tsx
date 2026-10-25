@@ -16,7 +16,8 @@ const THEME_OPTIONS = [
 ]
 
 export function GeneralPage() {
-  const { info, theme, changeTheme, prefsReady, analyticsEnabled, setAnalyticsEnabled, setError } = useStore()
+  const { info, theme, changeTheme, prefsReady, analyticsEnabled, setAnalyticsEnabled, setError, runSettingsWrite } =
+    useStore()
 
   const [autostart, setAutostart] = useState<boolean | null>(null)
   const [confirmingReset, setConfirmingReset] = useState(false)
@@ -31,7 +32,7 @@ export function GeneralPage() {
 
   async function toggleAutostart(next: boolean) {
     try {
-      const s = await autostartSet(next)
+      const s = await runSettingsWrite('autostart', () => autostartSet(next))
       setAutostart(s.enabled)
       track('setting_changed', { key: 'autostart', value: s.enabled ? 'on' : 'off' })
     } catch (e) {
@@ -43,7 +44,7 @@ export function GeneralPage() {
     setBusy(true)
     setNote(null)
     try {
-      await prefsReset()
+      await runSettingsWrite('preferences-reset', prefsReset)
       setNote('已恢复默认设置。部分改动需重启应用生效。')
     } catch (e) {
       setError(formatCmdError(e))

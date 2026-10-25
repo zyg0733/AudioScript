@@ -74,12 +74,14 @@ interface Store {
 
   updateInfo: UpdateCheckResult | null
   updatePhase: UpdatePhase
+  updateRestarting: boolean
   updateProgress: UpdateProgress | null
   updateError: string | null
   installedVersion: string | null
   checkUpdate: (silent?: boolean) => Promise<void>
   installUpdate: () => Promise<void>
   restartApp: () => Promise<void>
+  runSettingsWrite: <T>(key: string, write: () => Promise<T>) => Promise<T>
 
   onboardingDone: boolean
   completeOnboarding: () => Promise<void>
@@ -113,6 +115,7 @@ interface Store {
 const STOP_TIMEOUT_MS = 8_000
 
 const START_TIMEOUT_MS = 60_000
+const SETTINGS_UPDATE_LOCKED = '正在下载、安装更新或重启，暂时不能修改设置，请等待完成后再试'
 
 const Ctx = createContext<Store | null>(null)
 
@@ -149,6 +152,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const overlayCfgRef = useRef<OverlayConfig | null>(null)
   const overlayVersion = useRef(0)
   const overlayQueue = useRef<Promise<void>>(Promise.resolve())
+  const overlayWriteError = useRef<string | null>(null)
   const [overlayVisible, setOverlayVisible] = useState(false)
 
   const [hotkeys, setHotkeys] = useState<HotkeyInfo[]>([])
@@ -164,6 +168,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const pendingRef = useRef(false)
   const prefsQueue = useRef<Promise<void>>(Promise.resolve())
   const prefsFailureVersion = useRef(0)
+  const prefsWriteErrors = useRef(new Map<string, string>())
+  const settingsWrites = useRef(new Set<Promise<void>>())
+  const settingsWriteQueues = useRef(new Map<string, Promise<void>>())
+  const settingsWriteVersion = useRef(0)
+  const settingsWriteErrors = useRef(new Map<string, string>())
   const lifetime = useRef({ active: true, version: 0 })
 
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null)
@@ -171,7 +180,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null)
   const [updateError, setUpdateError] = useState<string | null>(null)
   const [installedVersion, setInstalledVersion] = useState<string | null>(null)
+  const [updateRestarting, setUpdateRestarting] = useState(false)
   const updateBusyRef = useRef(false)
+  const updateExclusiveRef = useRef(false)
 
   useEffect(() => {
     lifetime.current.active = true
@@ -345,14 +356,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [theme, applyTheme])
 
   const savePrefs = useCallback((patch: PrefsPatch) => {
+    if (updateExclusiveRef.current) return Promise.reject(new Error(SETTINGS_UPDATE_LOCKED))
     const version = lifetime.current.version
     const request = prefsQueue.current.then(async () => {
       if (!lifetime.current.active || version !== lifetime.current.version) return null
       try {
         const saved = await prefsSet(patch)
+        if (lifetime.current.active && version === lifetime.current.version) {
+          for (const key of Object.keys(patch)) prefsWriteErrors.current.delete(key)
+        }
         return lifetime.current.active && version === lifetime.current.version ? saved : null
       } catch (error) {
         if (!lifetime.current.active || version !== lifetime.current.version) return null
+        for (const key of Object.keys(patch)) prefsWriteErrors.current.set(key, formatCmdError(error))
         throw error
       }
     })
@@ -362,6 +378,30 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         prefsFailureVersion.current += 1
       },
     )
+    return request
+  }, [])
+
+  const runSettingsWrite = useCallback(function run<T>(key: string, write: () => Promise<T>): Promise<T> {
+    if (updateExclusiveRef.current) return Promise.reject(new Error(SETTINGS_UPDATE_LOCKED))
+    const version = lifetime.current.version
+    const request = (settingsWriteQueues.current.get(key) ?? Promise.resolve()).then(write)
+    settingsWriteVersion.current += 1
+    const tracked = request.then(
+      () => {
+        if (lifetime.current.active && version === lifetime.current.version) settingsWriteErrors.current.delete(key)
+        settingsWrites.current.delete(tracked)
+        if (settingsWriteQueues.current.get(key) === tracked) settingsWriteQueues.current.delete(key)
+      },
+      (error) => {
+        if (lifetime.current.active && version === lifetime.current.version) {
+          settingsWriteErrors.current.set(key, formatCmdError(error))
+        }
+        settingsWrites.current.delete(tracked)
+        if (settingsWriteQueues.current.get(key) === tracked) settingsWriteQueues.current.delete(key)
+      },
+    )
+    settingsWrites.current.add(tracked)
+    settingsWriteQueues.current.set(key, tracked)
     return request
   }, [])
 
@@ -388,9 +428,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   )
 
   const completeOnboarding = useCallback(async () => {
-    setOnboardingDone(true)
     try {
-      if (await savePrefs({ onboardingDone: true })) track('onboarding_completed')
+      const saved = await savePrefs({ onboardingDone: true })
+      if (saved) {
+        setOnboardingDone(saved.onboardingDone)
+        track('onboarding_completed')
+      }
     } catch (e) {
       setError(formatCmdError(e))
     }
@@ -432,6 +475,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const toggleSession = useCallback(async () => {
     if (pendingRef.current) return
+    if (status !== TaskStatus.Capturing && updateExclusiveRef.current) {
+      setError('正在下载、安装更新或重启，请等待完成后再开始转写')
+      return
+    }
     pendingRef.current = true
     setPending(true)
     setError(null)
@@ -496,6 +543,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const updateOverlay = useCallback(
     (patch: Partial<OverlayConfig>) => {
+      if (updateExclusiveRef.current) {
+        setOverlayCfg((config) => config && { ...config })
+        setError(SETTINGS_UPDATE_LOCKED)
+        return Promise.resolve()
+      }
       const lifetimeVersion = lifetime.current.version
       const request = overlayQueue.current.then(async () => {
         if (!lifetime.current.active || lifetimeVersion !== lifetime.current.version) return
@@ -505,9 +557,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         try {
           const saved = await overlayConfigSet({ ...current, ...patch })
           if (!lifetime.current.active || lifetimeVersion !== lifetime.current.version) return
+          overlayWriteError.current = null
           if (version === overlayVersion.current) applyOverlay(saved)
         } catch (e) {
           if (!lifetime.current.active || lifetimeVersion !== lifetime.current.version) return
+          overlayWriteError.current = formatCmdError(e)
           setOverlayCfg((config) => config && { ...config })
           setError(formatCmdError(e))
         }
@@ -520,11 +574,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const toggleOverlay = useCallback(async () => {
     try {
-      setOverlayVisible(await overlayToggle())
+      setOverlayVisible(await runSettingsWrite('overlay-visibility', overlayToggle))
     } catch (e) {
       setError(formatCmdError(e))
     }
-  }, [])
+  }, [runSettingsWrite])
 
   const refreshHotkeys = useCallback(async () => {
     try {
@@ -599,18 +653,48 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  const flushSettings = useCallback(async () => {
+    let preferences: Promise<void>
+    let overlay: Promise<void>
+    let directVersion: number
+    do {
+      preferences = prefsQueue.current
+      overlay = overlayQueue.current
+      directVersion = settingsWriteVersion.current
+      await Promise.all([preferences, overlay, ...settingsWrites.current])
+    } while (
+      preferences !== prefsQueue.current ||
+      overlay !== overlayQueue.current ||
+      directVersion !== settingsWriteVersion.current
+    )
+    const failure =
+      prefsWriteErrors.current.values().next().value ??
+      overlayWriteError.current ??
+      settingsWriteErrors.current.values().next().value
+    if (failure) throw new Error(`设置尚未保存，请先重试保存：${failure}`)
+  }, [])
+
   const installUpdate = useCallback(async () => {
+    if (updateBusyRef.current) return
     if (!info?.updaterEnabled || !updateInfo?.enabled || !updateInfo.available) {
       setUpdateError(info?.updaterDisabledReason ?? updateInfo?.disabledReason ?? '当前没有可安装的更新')
       setUpdatePhase('error')
       return
     }
-    if (updateBusyRef.current) return
+    if (pendingRef.current || status === TaskStatus.Capturing) {
+      setUpdateError('请先停止转写并等待会话收尾完成，再安装更新')
+      setUpdatePhase('error')
+      return
+    }
     updateBusyRef.current = true
+    updateExclusiveRef.current = true
     setUpdatePhase('downloading')
     setUpdateError(null)
     setUpdateProgress({ downloaded: 0, total: null })
     try {
+      const version = lifetime.current.version
+      await flushSettings()
+      if (!lifetime.current.active || version !== lifetime.current.version) return
       const r = await updateInstall()
       setInstalledVersion(r.version)
       setUpdatePhase('ready')
@@ -619,16 +703,37 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setUpdateError(formatCmdError(e))
     } finally {
       updateBusyRef.current = false
+      updateExclusiveRef.current = false
     }
-  }, [info, updateInfo])
+  }, [info, updateInfo, status, flushSettings])
 
   const restartApp = useCallback(async () => {
+    if (updateBusyRef.current) return
+    if (updatePhase !== 'ready' || !installedVersion) {
+      setError('请先完成更新安装，再重启应用')
+      return
+    }
+    if (pendingRef.current || status === TaskStatus.Capturing) {
+      setError('请先停止转写并等待会话收尾完成，再重启应用')
+      return
+    }
+    updateBusyRef.current = true
+    updateExclusiveRef.current = true
+    setUpdateRestarting(true)
     try {
+      const version = lifetime.current.version
+      await flushSettings()
+      if (!lifetime.current.active || version !== lifetime.current.version) return
       await updateRestart()
+      setError(null)
     } catch (e) {
       setError(formatCmdError(e))
+    } finally {
+      updateBusyRef.current = false
+      updateExclusiveRef.current = false
+      setUpdateRestarting(false)
     }
-  }, [])
+  }, [updatePhase, installedVersion, status, flushSettings])
 
   const autoCheckedRef = useRef(false)
   useEffect(() => {
@@ -643,12 +748,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       info,
       updateInfo,
       updatePhase,
+      updateRestarting,
       updateProgress,
       updateError,
       installedVersion,
       checkUpdate,
       installUpdate,
       restartApp,
+      runSettingsWrite,
       prefsReady,
       audioSource,
       device,
@@ -694,12 +801,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       info,
       updateInfo,
       updatePhase,
+      updateRestarting,
       updateProgress,
       updateError,
       installedVersion,
       checkUpdate,
       installUpdate,
       restartApp,
+      runSettingsWrite,
       prefsReady,
       audioSource,
       device,

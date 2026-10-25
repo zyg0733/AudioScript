@@ -12,7 +12,16 @@ import { Slider } from '@/ui/Slider'
 import { Switch } from '@/ui/Switch'
 
 export function OverlayPage() {
-  const { overlayCfg, overlayVisible, toggleOverlay, updateOverlay, hotkeys, refreshHotkeys, setError } = useStore()
+  const {
+    overlayCfg,
+    overlayVisible,
+    toggleOverlay,
+    updateOverlay,
+    hotkeys,
+    refreshHotkeys,
+    setError,
+    runSettingsWrite,
+  } = useStore()
 
   const [draft, setDraft] = useState<OverlayConfig | null>(overlayCfg)
   useEffect(() => setDraft(overlayCfg), [overlayCfg])
@@ -27,7 +36,7 @@ export function OverlayPage() {
 
   async function rebind(id: string, accelerator: string) {
     try {
-      await shortcutsSet(id, accelerator)
+      await runSettingsWrite(`shortcut:${id}`, () => shortcutsSet(id, accelerator))
       await refreshHotkeys()
     } catch (e) {
       setError(formatCmdError(e))

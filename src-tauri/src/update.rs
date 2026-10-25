@@ -1,7 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
 
 const PROGRESS_EVENT: &str = "update://progress";
@@ -13,8 +11,6 @@ pub fn public_key() -> Option<&'static str> {
         .map(str::trim)
         .filter(|key| !key.is_empty())
 }
-
-static INSTALLING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,14 +28,6 @@ pub struct UpdateCheck {
 struct Progress {
     downloaded: u64,
     total: Option<u64>,
-}
-
-struct InstallGuard;
-
-impl Drop for InstallGuard {
-    fn drop(&mut self) {
-        INSTALLING.store(false, Ordering::SeqCst);
-    }
 }
 
 pub async fn check(app: &AppHandle) -> Result<UpdateCheck, String> {
@@ -96,10 +84,8 @@ pub async fn install(app: &AppHandle) -> Result<String, String> {
     if public_key().is_none() {
         return Err(DISABLED_REASON.into());
     }
-    if INSTALLING.swap(true, Ordering::SeqCst) {
-        return Err("正在更新，请稍候".into());
-    }
-    let _guard = InstallGuard;
+    let state = app.state::<crate::session::SessionState>();
+    let _guard = state.reserve_update()?;
 
     let updater = app
         .updater_builder()

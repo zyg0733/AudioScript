@@ -30,7 +30,7 @@ interface Failure {
 }
 
 export function ModelsPage() {
-  const { status, setError } = useStore()
+  const { status, setError, runSettingsWrite } = useStore()
   const capturing = status === TaskStatus.Capturing
 
   const [list, setList] = useState<ModelsList | null>(null)
@@ -112,7 +112,8 @@ export function ModelsPage() {
   async function select(modelId: string) {
     setBusyId(modelId)
     try {
-      setList(await modelSelect(modelId))
+      const kind = [...(list?.asr ?? []), ...(list?.mt ?? [])].find((model) => model.id === modelId)?.kind ?? modelId
+      setList(await runSettingsWrite(`model-selection:${kind}`, () => modelSelect(modelId)))
       setConfirmRemove(null)
     } catch (e) {
       setError(formatCmdError(e))

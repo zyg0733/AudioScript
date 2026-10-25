@@ -185,6 +185,8 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdErro
         "app_info" => Ok(app_info()),
 
         "update_restart" => {
+            let state = app.state::<session::SessionState>();
+            let _guard = state.reserve_restart().map_err(CmdError::Failed)?;
             tracing::info!("正在重启以应用更新");
             app.restart();
         }

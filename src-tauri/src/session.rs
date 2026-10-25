@@ -20,7 +20,7 @@ use crate::translate::Translator;
 
 mod lifecycle;
 
-use lifecycle::{Failure, Lifecycle};
+use lifecycle::{ExclusiveOperation, Failure, Lifecycle};
 
 const TRANSLATE_QUEUE_CAPACITY: usize = 32;
 
@@ -287,7 +287,44 @@ pub struct SessionState {
     teardown_active: AtomicBool,
 }
 
+pub(crate) struct OperationGuard<'a> {
+    state: &'a SessionState,
+    operation: ExclusiveOperation,
+}
+
+impl Drop for OperationGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .release_exclusive(self.operation);
+    }
+}
+
 impl SessionState {
+    fn reserve_operation(
+        &self,
+        operation: ExclusiveOperation,
+    ) -> Result<OperationGuard<'_>, String> {
+        self.lifecycle
+            .lock()
+            .expect("session lifecycle mutex poisoned")
+            .reserve_exclusive(operation, self.teardown_active.load(Ordering::SeqCst))?;
+        Ok(OperationGuard {
+            state: self,
+            operation,
+        })
+    }
+
+    pub(crate) fn reserve_update(&self) -> Result<OperationGuard<'_>, String> {
+        self.reserve_operation(ExclusiveOperation::Update)
+    }
+
+    pub(crate) fn reserve_restart(&self) -> Result<OperationGuard<'_>, String> {
+        self.reserve_operation(ExclusiveOperation::Restart)
+    }
+
     fn clear_with(&self, emit: impl FnOnce(Vec<TranscriptSegment>)) -> Result<(), String> {
         let _broadcast = self
             .broadcast
@@ -1487,6 +1524,59 @@ mod tests {
             .clear_with(|segments| assert!(segments.is_empty()))
             .unwrap();
         assert!(state.snapshot().is_empty());
+    }
+
+    #[test]
+    fn failed_update_releases_the_reservation_for_a_retry_or_new_session() {
+        fn fail_after_reserving(state: &SessionState) -> Result<(), String> {
+            let _guard = state.reserve_update()?;
+            Err("下载失败".into())
+        }
+
+        let state = SessionState::default();
+        assert_eq!(fail_after_reserving(&state), Err("下载失败".into()));
+        drop(state.reserve_update().unwrap());
+        drop(state.reserve_restart().unwrap());
+        assert!(state.lifecycle.lock().unwrap().begin().is_ok());
+    }
+
+    #[test]
+    fn cancelling_an_update_future_releases_its_session_reservation() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let state = SessionState::default();
+        let mut update = Box::pin(async {
+            let _guard = state.reserve_update().unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(update.as_mut().poll(&mut context), Poll::Pending));
+        assert!(state.lifecycle.lock().unwrap().begin().is_err());
+        assert!(state.reserve_restart().is_err());
+        state.lifecycle.lock().unwrap().stop();
+        assert!(state.lifecycle.lock().unwrap().begin().is_err());
+        drop(update);
+        assert!(state.lifecycle.lock().unwrap().begin().is_ok());
+    }
+
+    #[test]
+    fn restart_reservation_rejects_initializing_and_teardown_even_when_status_is_ready() {
+        let state = SessionState::default();
+        let epoch = state.lifecycle.lock().unwrap().begin().unwrap();
+        assert_eq!(state.status(), TaskStatus::Ready);
+        assert!(state.reserve_restart().is_err());
+        state.lifecycle.lock().unwrap().stop();
+        assert!(state.reserve_restart().is_err());
+        state.lifecycle.lock().unwrap().abort_start(epoch);
+        state.teardown_active.store(true, Ordering::SeqCst);
+        assert!(state.reserve_restart().is_err());
+        state.teardown_active.store(false, Ordering::SeqCst);
+        let guard = state.reserve_restart().unwrap();
+        assert!(state.lifecycle.lock().unwrap().begin().is_err());
+        assert!(state.reserve_update().is_err());
+        drop(guard);
+        assert!(state.lifecycle.lock().unwrap().begin().is_ok());
     }
 
     #[test]
