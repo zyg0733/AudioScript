@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '@/main/store'
-import { formatCmdError, type ModelsList, modelsList, openRepo, openSponsor, openUrl } from '@/shared/ipc'
+import { formatCmdError, type ModelsList, modelsList, openRepo, openUrl } from '@/shared/ipc'
 import { ModelKind, TaskStatus } from '@/shared/types'
 import { Button } from '@/ui/Button'
 import { Icon } from '@/ui/Icon'
@@ -51,9 +51,9 @@ export function AboutPage() {
     }
   }
 
-  async function openSponsorPage() {
+  async function openRepositoryPage() {
     try {
-      await openSponsor()
+      await openRepo()
     } catch (e) {
       setError(formatCmdError(e))
     }
@@ -152,26 +152,16 @@ export function AboutPage() {
           }
         />
         <SettingsRow
+          icon="github"
+          title="GitHub 仓库"
+          description={info?.links?.repository}
+          onClick={() => void openRepositoryPage()}
+          control={<Icon name="chevron" size={16} className="mt-0.5 text-[var(--color-ink-2)]" />}
+        />
+        <SettingsRow
           icon="external"
           title="官网"
           onClick={() => void openSite()}
-          control={<Icon name="chevron" size={16} className="mt-0.5 text-[var(--color-ink-2)]" />}
-        />
-      </SettingsGroup>
-
-      <SettingsGroup title="原项目与作者">
-        <SettingsRow
-          icon="github"
-          title="基于 Nico 的 AudioScript 继续开发"
-          description="当前分支由 zyg0733 维护，保留原作者署名与 MIT 许可。"
-          onClick={() => info && void openUrl(info.links.upstreamRepository).catch((e) => setError(formatCmdError(e)))}
-          control={<Icon name="chevron" size={16} className="mt-0.5 text-[var(--color-ink-2)]" />}
-        />
-        <SettingsRow
-          icon="heart"
-          title="赞助原作者 Nico"
-          description="爱发电入口属于原作者，款项用于支持原作者。"
-          onClick={() => void openSponsorPage()}
           control={<Icon name="chevron" size={16} className="mt-0.5 text-[var(--color-ink-2)]" />}
         />
       </SettingsGroup>
@@ -185,7 +175,7 @@ export function AboutPage() {
               <Mono>MIT</Mono>
             </span>
           }
-          onClick={() => void openRepo()}
+          onClick={() => void openRepositoryPage()}
           control={<Icon name="chevron" size={16} className="mt-0.5 text-[var(--color-ink-2)]" />}
         />
       </SettingsGroup>

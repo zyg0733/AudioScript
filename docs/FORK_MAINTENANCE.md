@@ -1,6 +1,6 @@
 # AudioScript fork 维护
 
-当前维护仓库为 [zyg0733/AudioScript](https://github.com/zyg0733/AudioScript)，基于 [Nico 的原项目](https://github.com/niyongsheng/AudioScript)。保留 AudioScript 品牌、原作者署名和原 MIT LICENSE。应用中的赞助入口明确属于原作者 Nico。
+当前维护仓库为 [zyg0733/AudioScript](https://github.com/zyg0733/AudioScript)，基于 [Nico 的原项目](https://github.com/niyongsheng/AudioScript)。保留 AudioScript 品牌、README 中的原作者署名和原 MIT LICENSE。应用「关于」页展示本 fork 的 GitHub 和官网，不展示原项目及赞助入口。
 
 ## 应用身份与链接
 
