@@ -46,8 +46,9 @@ function BootSplash() {
 
 function Shell() {
   const [page, setPage] = useState<PageId>('transcribe')
-  const { status } = useStore()
+  const { status, updatePhase, updateRestarting } = useStore()
   const capturing = status === TaskStatus.Capturing
+  const updating = updatePhase === 'downloading' || updateRestarting
 
   return (
     <main className="flex h-full">
@@ -59,7 +60,9 @@ function Shell() {
         <Alerts page={page} onOpenPermissions={() => setPage('permissions')} onOpenAbout={() => setPage('about')} />
 
         <div className="flex-1 overflow-y-auto">
-          <PageSwitch page={page} onOpenPermissions={() => setPage('permissions')} />
+          <fieldset disabled={updating} className="m-0 min-w-0 border-0 p-0">
+            <PageSwitch page={page} onOpenPermissions={() => setPage('permissions')} />
+          </fieldset>
         </div>
 
         <footer className="border-[var(--color-border-subtle)] border-t py-2">
@@ -73,11 +76,15 @@ function Shell() {
 }
 
 function PrimaryActionSlot() {
-  const { status, pending, activeDevice, toggleSession } = useStore()
+  const { status, pending, activeDevice, toggleSession, updatePhase, updateRestarting } = useStore()
+  const capturing = status === TaskStatus.Capturing
   return (
     <PrimaryAction
-      capturing={status === TaskStatus.Capturing}
+      capturing={capturing}
       pending={pending}
+      disabledReason={
+        !capturing && (updatePhase === 'downloading' || updateRestarting) ? '正在更新，暂不可开始转写' : undefined
+      }
       activeDevice={activeDevice}
       onToggle={() => void toggleSession()}
     />
@@ -127,10 +134,16 @@ function Alerts({ page, onOpenPermissions, onOpenAbout }: AlertsProps) {
     setPermissionError,
     updateInfo,
     updatePhase,
+    updateRestarting,
   } = useStore()
 
   return (
     <>
+      {(updatePhase === 'downloading' || updateRestarting) && (
+        <Alert tone="info" title="正在更新，设置暂不可修改">
+          请等待安装或重启完成。
+        </Alert>
+      )}
       {updateInfo?.available && page !== 'about' && updatePhase !== 'downloading' && updatePhase !== 'ready' && (
         <Alert tone="info" title={`发现新版本 v${updateInfo.version ?? ''}`}>
           <Button size="sm" onClick={onOpenAbout}>

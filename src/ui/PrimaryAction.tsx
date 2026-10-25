@@ -5,6 +5,7 @@ import { Icon } from './Icon'
 interface Props {
   capturing: boolean
   pending: boolean
+  disabledReason?: string
   activeDevice: string | null
   onToggle: () => void
 }
@@ -88,15 +89,17 @@ const POOL: CSSProperties = {
   background: 'radial-gradient(80px circle at var(--px, 50%) var(--py, 50%), rgb(255 255 255 / 0.22), transparent 65%)',
 }
 
-export function PrimaryAction({ capturing, pending, activeDevice, onToggle }: Props) {
+export function PrimaryAction({ capturing, pending, disabledReason, activeDevice, onToggle }: Props) {
   const { ref, onPointerMove } = useSpecularFollow()
   const elapsed = useElapsed(capturing)
 
   const state = pending
     ? { label: capturing ? '停止中…' : '启动中…', dot: 'bg-[var(--color-warn)] animate-pulse' }
-    : capturing
-      ? { label: activeDevice ?? '采集中', dot: 'bg-[var(--color-danger)] animate-pulse' }
-      : { label: '就绪', dot: 'bg-[var(--color-success)]' }
+    : disabledReason
+      ? { label: disabledReason, dot: 'bg-[var(--color-warn)]' }
+      : capturing
+        ? { label: activeDevice ?? '采集中', dot: 'bg-[var(--color-danger)] animate-pulse' }
+        : { label: '就绪', dot: 'bg-[var(--color-success)]' }
 
   return (
     <div className="space-y-2">
@@ -105,7 +108,7 @@ export function PrimaryAction({ capturing, pending, activeDevice, onToggle }: Pr
         type="button"
         onClick={onToggle}
         onPointerMove={onPointerMove}
-        disabled={pending}
+        disabled={pending || Boolean(disabledReason)}
         className={cn(
           'group relative flex w-full items-center justify-center rounded-[var(--radius-ctl)] px-3 py-2',
           'font-medium text-sm transition disabled:cursor-not-allowed disabled:opacity-50',

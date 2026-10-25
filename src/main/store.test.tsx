@@ -15,7 +15,15 @@ const ipc = vi.hoisted(() => ({
   overlayConfigSet: vi.fn(),
   sessionStatus: vi.fn(),
   sessionStart: vi.fn(),
+  sessionStop: vi.fn(),
+  updateCheck: vi.fn(),
   updateInstall: vi.fn(),
+  updateRestart: vi.fn(),
+  prefsReset: vi.fn(),
+  autostartSet: vi.fn(),
+  shortcutsSet: vi.fn(),
+  modelSelect: vi.fn(),
+  overlayToggle: vi.fn(),
   setTrackingEnabled: vi.fn(),
 }))
 
@@ -32,7 +40,15 @@ vi.mock('@/shared/ipc', async () => ({
   prefsSet: ipc.prefsSet,
   sessionStatus: ipc.sessionStatus,
   sessionStart: ipc.sessionStart,
+  sessionStop: ipc.sessionStop,
+  updateCheck: ipc.updateCheck,
   updateInstall: ipc.updateInstall,
+  updateRestart: ipc.updateRestart,
+  prefsReset: ipc.prefsReset,
+  autostartSet: ipc.autostartSet,
+  shortcutsSet: ipc.shortcutsSet,
+  modelSelect: ipc.modelSelect,
+  overlayToggle: ipc.overlayToggle,
   hotkeyFailures: vi.fn(async () => []),
   shortcutsGet: vi.fn(async () => []),
   overlayConfigGet: ipc.overlayConfigGet,
@@ -77,6 +93,19 @@ describe('StoreProvider session and fork capabilities', () => {
     })
   }
 
+  async function availableUpdate() {
+    info.updaterEnabled = true
+    info.updaterDisabledReason = null
+    await render()
+    await act(async () => store.checkUpdate())
+  }
+
+  async function installedUpdate() {
+    await availableUpdate()
+    await act(async () => store.installUpdate())
+    expect(store.updatePhase).toBe('ready')
+  }
+
   beforeEach(() => {
     for (const mock of Object.values(ipc)) mock.mockReset()
     vi.stubGlobal('matchMedia', () => ({
@@ -116,6 +145,7 @@ describe('StoreProvider session and fork capabilities', () => {
       zhScript: ZhScript.Simplified,
       theme: Theme.Light,
       analyticsEnabled: false,
+      onboardingDone: false,
       endpoint: { trailingSilenceMs: 800, maxUtteranceMs: 8000 },
       overlay: {
         enable: true,
@@ -137,6 +167,22 @@ describe('StoreProvider session and fork capabilities', () => {
     ipc.overlayConfigGet.mockResolvedValue(savedPrefs.overlay)
     ipc.overlayConfigSet.mockImplementation(async (config) => config)
     ipc.sessionStatus.mockResolvedValue({ status: TaskStatus.Ready, device: null, error: null })
+    ipc.sessionStop.mockResolvedValue(null)
+    ipc.updateCheck.mockResolvedValue({
+      currentVersion: '0.2.12',
+      enabled: true,
+      disabledReason: null,
+      available: true,
+      version: '0.2.13',
+      notes: null,
+    })
+    ipc.updateInstall.mockResolvedValue({ version: '0.2.13' })
+    ipc.updateRestart.mockResolvedValue(null)
+    ipc.prefsReset.mockImplementation(async () => savedPrefs)
+    ipc.autostartSet.mockImplementation(async (enabled) => ({ enabled }))
+    ipc.shortcutsSet.mockResolvedValue([])
+    ipc.modelSelect.mockResolvedValue({ asr: [], mt: [] })
+    ipc.overlayToggle.mockResolvedValue(true)
     container = document.createElement('div')
     document.body.append(container)
     root = createRoot(container)
@@ -391,6 +437,364 @@ describe('StoreProvider session and fork capabilities', () => {
     await act(async () => store.installUpdate())
     expect(ipc.updateInstall).not.toHaveBeenCalled()
     expect(store.updateError).toBe(info.updaterDisabledReason)
+  })
+
+  it('rejects installing during capture or a pending session start', async () => {
+    await availableUpdate()
+    ipc.sessionStatus.mockResolvedValue({ status: TaskStatus.Capturing, device: '麦克风', error: null })
+    await act(async () => listeners.get(EVENT.taskState)?.(TaskStatus.Capturing))
+    await act(async () => store.installUpdate())
+    expect(ipc.updateInstall).not.toHaveBeenCalled()
+
+    ipc.sessionStatus.mockResolvedValue({ status: TaskStatus.Ready, device: null, error: null })
+    await act(async () => listeners.get(EVENT.taskState)?.(TaskStatus.Ready))
+    const starting = deferred<TaskStatus>()
+    ipc.sessionStart.mockReturnValueOnce(starting.promise)
+    let toggle!: Promise<void>
+    await act(async () => {
+      toggle = store.toggleSession()
+    })
+    expect(store.pending).toBe(true)
+    await act(async () => store.installUpdate())
+    expect(ipc.updateInstall).not.toHaveBeenCalled()
+    expect(store.updateError).toContain('等待会话收尾')
+    await act(async () => {
+      starting.resolve(TaskStatus.Capturing)
+      await toggle
+    })
+  })
+
+  it('blocks starting throughout installation and permits retry after an installation failure', async () => {
+    await availableUpdate()
+    const installing = deferred<{ version: string }>()
+    ipc.updateInstall.mockReturnValueOnce(installing.promise)
+    let install!: Promise<void>
+    await act(async () => {
+      install = store.installUpdate()
+      await store.toggleSession()
+    })
+    expect(ipc.sessionStart).not.toHaveBeenCalled()
+    expect(store.error).toContain('正在下载、安装更新或重启')
+    await act(async () => {
+      installing.reject(new Error('下载连接断开'))
+      await install
+    })
+    expect(store.updatePhase).toBe('error')
+    expect(store.updateError).toContain('下载连接断开')
+    await act(async () => store.installUpdate())
+    expect(ipc.updateInstall).toHaveBeenCalledTimes(2)
+    expect(store.updateError).toBeNull()
+    expect(store.updatePhase).toBe('ready')
+  })
+
+  it('waits for pending preferences before installation because Windows exits after installing', async () => {
+    await availableUpdate()
+    const saving = deferred<Preferences>()
+    ipc.prefsSet.mockReturnValueOnce(saving.promise)
+    let install!: Promise<void>
+    await act(async () => {
+      store.setDirection('zh', ZhScript.Traditional)
+      install = store.installUpdate()
+    })
+    expect(ipc.updateInstall).not.toHaveBeenCalled()
+    await act(async () => {
+      saving.resolve({ ...savedPrefs, sourceLang: 'zh', zhScript: ZhScript.Traditional })
+      await install
+    })
+    expect(ipc.updateInstall).toHaveBeenCalledOnce()
+  })
+
+  it('drains previously queued settings and refuses new changes while restart is waiting', async () => {
+    await installedUpdate()
+    const preferences = deferred<Preferences>()
+    const laterPreferences = deferred<Preferences>()
+    const overlay = deferred<OverlayConfig>()
+    const laterOverlay = deferred<OverlayConfig>()
+    ipc.prefsSet.mockReturnValueOnce(preferences.promise).mockReturnValueOnce(laterPreferences.promise)
+    ipc.overlayConfigSet.mockReturnValueOnce(overlay.promise).mockReturnValueOnce(laterOverlay.promise)
+    let restarting!: Promise<void>
+    await act(async () => {
+      store.setDirection('zh', ZhScript.Traditional)
+      store.setTranslateEngine(TranslateEngine.Off)
+      void store.updateOverlay({ glow: false })
+      void store.updateOverlay({ fontSize: 30 })
+      restarting = store.restartApp()
+    })
+    expect(store.updateRestarting).toBe(true)
+    expect(ipc.updateRestart).not.toHaveBeenCalled()
+    await act(async () => {
+      store.setDevice('更新期间不能写入的设备')
+      void store.updateOverlay({ opacity: 90 })
+      await store.restartApp()
+      await store.toggleSession()
+      preferences.resolve({ ...savedPrefs, sourceLang: 'zh', zhScript: ZhScript.Traditional })
+      overlay.resolve({ ...savedPrefs.overlay, glow: false })
+    })
+    expect(ipc.updateRestart).not.toHaveBeenCalled()
+    expect(ipc.sessionStart).not.toHaveBeenCalled()
+    await act(async () => {
+      laterPreferences.resolve({ ...savedPrefs, sourceLang: 'zh', translateEngine: TranslateEngine.Off })
+      laterOverlay.resolve({ ...savedPrefs.overlay, glow: false, fontSize: 30 })
+      await restarting
+    })
+    expect(ipc.updateRestart).toHaveBeenCalledOnce()
+    expect(ipc.prefsSet).toHaveBeenCalledTimes(2)
+    expect(ipc.overlayConfigSet).toHaveBeenCalledTimes(2)
+    expect(store.device).not.toBe('更新期间不能写入的设备')
+    expect(store.overlayCfg?.opacity).toBe(60)
+    expect(store.updateRestarting).toBe(false)
+  })
+
+  it('rejects new preference and overlay writes during installation without poisoning a later retry', async () => {
+    await availableUpdate()
+    const installing = deferred<{ version: string }>()
+    ipc.updateInstall.mockReturnValueOnce(installing.promise)
+    let install!: Promise<void>
+    await act(async () => {
+      install = store.installUpdate()
+    })
+    const endpoint = store.endpoint
+    const overlay = store.overlayCfg
+    await act(async () => {
+      store.setDirection('zh', ZhScript.Traditional)
+      await store.setEndpoint({ trailingSilenceMs: 500, maxUtteranceMs: 6000 })
+      await store.updateOverlay({ fontSize: 30 })
+      await store.completeOnboarding()
+    })
+    expect(ipc.prefsSet).not.toHaveBeenCalled()
+    expect(ipc.overlayConfigSet).not.toHaveBeenCalled()
+    expect(store.sourceLang).toBe('en')
+    expect(store.endpoint).toEqual(endpoint)
+    expect(store.endpoint).not.toBe(endpoint)
+    expect(store.overlayCfg).toEqual(overlay)
+    expect(store.overlayCfg).not.toBe(overlay)
+    expect(store.onboardingDone).toBe(false)
+    expect(store.error).toContain('暂时不能修改设置')
+    await act(async () => {
+      installing.reject(new Error('下载中断'))
+      await install
+    })
+    await act(async () => store.installUpdate())
+    expect(store.updatePhase).toBe('ready')
+    await act(async () => store.restartApp())
+    expect(ipc.updateRestart).toHaveBeenCalledOnce()
+  })
+
+  it('waits for an already pending reset before installation and blocks newly requested direct writes', async () => {
+    await availableUpdate()
+    const reset = deferred<Preferences>()
+    ipc.prefsReset.mockReturnValueOnce(reset.promise)
+    let resetting!: Promise<Preferences>
+    let installing!: Promise<void>
+    await act(async () => {
+      resetting = store.runSettingsWrite('preferences-reset', ipc.prefsReset)
+      installing = store.installUpdate()
+    })
+    expect(ipc.prefsReset).toHaveBeenCalledOnce()
+    expect(ipc.updateInstall).not.toHaveBeenCalled()
+    await expect(store.runSettingsWrite('autostart', () => ipc.autostartSet(true))).rejects.toThrow('暂时不能修改设置')
+    expect(ipc.autostartSet).not.toHaveBeenCalled()
+    await act(async () => {
+      reset.resolve(savedPrefs)
+      await resetting
+      await installing
+    })
+    expect(ipc.updateInstall).toHaveBeenCalledOnce()
+    await act(async () => store.restartApp())
+    expect(ipc.updateRestart).toHaveBeenCalledOnce()
+  })
+
+  it('waits for shortcut and autostart IPCs before restarting', async () => {
+    await installedUpdate()
+    const shortcut = deferred<[]>()
+    const autostart = deferred<{ enabled: boolean }>()
+    ipc.shortcutsSet.mockReturnValueOnce(shortcut.promise)
+    ipc.autostartSet.mockReturnValueOnce(autostart.promise)
+    let shortcutWrite!: Promise<[]>
+    let autostartWrite!: Promise<{ enabled: boolean }>
+    let restarting!: Promise<void>
+    await act(async () => {
+      shortcutWrite = store.runSettingsWrite('shortcut:toggle', () => ipc.shortcutsSet('toggle', 'Ctrl+Alt+A'))
+      autostartWrite = store.runSettingsWrite('autostart', () => ipc.autostartSet(true))
+      restarting = store.restartApp()
+    })
+    expect(ipc.updateRestart).not.toHaveBeenCalled()
+    await act(async () => {
+      shortcut.resolve([])
+      await shortcutWrite
+    })
+    expect(ipc.updateRestart).not.toHaveBeenCalled()
+    await act(async () => {
+      autostart.resolve({ enabled: true })
+      await autostartWrite
+      await restarting
+    })
+    expect(ipc.updateRestart).toHaveBeenCalledOnce()
+  })
+
+  it('propagates direct settings failures and requires a successful retry before restart', async () => {
+    await installedUpdate()
+    ipc.prefsReset.mockRejectedValueOnce(new Error('重置写入失败'))
+    await expect(store.runSettingsWrite('preferences-reset', ipc.prefsReset)).rejects.toThrow('重置写入失败')
+    await act(async () => store.restartApp())
+    expect(ipc.updateRestart).not.toHaveBeenCalled()
+    expect(store.error).toContain('重置写入失败')
+    expect(store.updatePhase).toBe('ready')
+    await act(async () => store.runSettingsWrite('preferences-reset', ipc.prefsReset))
+    await act(async () => store.restartApp())
+    expect(ipc.updateRestart).toHaveBeenCalledOnce()
+  })
+
+  it.each([true, false])(
+    'serializes same-key writes and preserves the latest outcome (latest fails: %s)',
+    async (latestFails) => {
+      await installedUpdate()
+      const first = deferred<{ enabled: boolean }>()
+      const second = deferred<{ enabled: boolean }>()
+      void second.promise.catch(() => {})
+      ipc.autostartSet.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+      let firstResult!: Promise<unknown>
+      let secondResult!: Promise<unknown>
+      await act(async () => {
+        firstResult = store.runSettingsWrite('autostart', () => ipc.autostartSet(true)).catch((error) => error)
+        secondResult = store.runSettingsWrite('autostart', () => ipc.autostartSet(false)).catch((error) => error)
+        if (latestFails) second.reject(new Error('最新自启动设置失败'))
+        else second.resolve({ enabled: false })
+      })
+      expect(ipc.autostartSet).toHaveBeenCalledTimes(1)
+      let restarting!: Promise<void>
+      await act(async () => {
+        restarting = store.restartApp()
+      })
+      expect(ipc.updateRestart).not.toHaveBeenCalled()
+      await act(async () => {
+        if (latestFails) first.resolve({ enabled: true })
+        else first.reject(new Error('较早自启动设置失败'))
+        await firstResult
+        await secondResult
+        await restarting
+      })
+      expect(ipc.autostartSet.mock.calls).toEqual([[true], [false]])
+      if (latestFails) {
+        expect(ipc.updateRestart).not.toHaveBeenCalled()
+        expect(store.error).toContain('最新自启动设置失败')
+      } else {
+        expect(ipc.updateRestart).toHaveBeenCalledOnce()
+        expect(store.error).toBeNull()
+      }
+    },
+  )
+
+  it('waits for model selection and overlay visibility persistence before installing', async () => {
+    await availableUpdate()
+    const selection = deferred<{ asr: []; mt: [] }>()
+    const visibility = deferred<boolean>()
+    ipc.modelSelect.mockReturnValueOnce(selection.promise)
+    ipc.overlayToggle.mockReturnValueOnce(visibility.promise)
+    let selecting!: Promise<{ asr: []; mt: [] }>
+    let toggling!: Promise<void>
+    let installing!: Promise<void>
+    await act(async () => {
+      selecting = store.runSettingsWrite('model-selection:asr', () => ipc.modelSelect('asr-high'))
+      toggling = store.toggleOverlay()
+      installing = store.installUpdate()
+    })
+    expect(ipc.updateInstall).not.toHaveBeenCalled()
+    await act(async () => {
+      selection.resolve({ asr: [], mt: [] })
+      await selecting
+    })
+    expect(ipc.updateInstall).not.toHaveBeenCalled()
+    await act(async () => {
+      visibility.resolve(true)
+      await toggling
+      await installing
+    })
+    expect(store.overlayVisible).toBe(true)
+    expect(ipc.updateInstall).toHaveBeenCalledOnce()
+  })
+
+  it('does not treat a failed overlay visibility save as a successful change or ignore it during restart', async () => {
+    await installedUpdate()
+    ipc.overlayToggle.mockRejectedValueOnce(new Error('悬浮窗可见性保存失败'))
+    await act(async () => store.toggleOverlay())
+    expect(store.overlayVisible).toBe(false)
+    await act(async () => store.restartApp())
+    expect(ipc.updateRestart).not.toHaveBeenCalled()
+    expect(store.error).toContain('悬浮窗可见性保存失败')
+    await act(async () => store.toggleOverlay())
+    await act(async () => store.restartApp())
+    expect(ipc.updateRestart).toHaveBeenCalledOnce()
+  })
+
+  it('keeps failed preference fields blocking restart until those fields are saved again', async () => {
+    await installedUpdate()
+    ipc.prefsSet.mockRejectedValueOnce(new Error('方向保存失败'))
+    await act(async () => store.setDirection('zh', ZhScript.Traditional))
+    await act(async () => store.changeTheme(Theme.Dark))
+    await act(async () => store.restartApp())
+    expect(ipc.updateRestart).not.toHaveBeenCalled()
+    expect(store.error).toContain('方向保存失败')
+    expect(store.updatePhase).toBe('ready')
+    expect(store.updateRestarting).toBe(false)
+    await act(async () => store.setDirection('zh', ZhScript.Traditional))
+    await act(async () => store.restartApp())
+    expect(ipc.updateRestart).toHaveBeenCalledOnce()
+  })
+
+  it('keeps an overlay save failure blocking restart and permits a successful retry', async () => {
+    await installedUpdate()
+    const saving = deferred<OverlayConfig>()
+    ipc.overlayConfigSet.mockReturnValueOnce(saving.promise)
+    let restarting!: Promise<void>
+    await act(async () => {
+      void store.updateOverlay({ fontSize: 30 })
+      restarting = store.restartApp()
+    })
+    await act(async () => {
+      saving.reject(new Error('悬浮窗配置写入失败'))
+      await restarting
+    })
+    expect(ipc.updateRestart).not.toHaveBeenCalled()
+    expect(store.error).toContain('悬浮窗配置写入失败')
+    expect(store.updatePhase).toBe('ready')
+    await act(async () => store.updateOverlay({ fontSize: 30 }))
+    await act(async () => store.restartApp())
+    expect(ipc.updateRestart).toHaveBeenCalledOnce()
+  })
+
+  it.each(['会话仍在启动', '会话仍在收尾'])(
+    'keeps an installed update retryable when restart rejects: %s',
+    async (message) => {
+      await installedUpdate()
+      ipc.updateRestart.mockRejectedValueOnce(new Error(message))
+      await act(async () => store.restartApp())
+      expect(store.error).toContain(message)
+      expect(store.updatePhase).toBe('ready')
+      expect(store.installedVersion).toBe('0.2.13')
+      expect(store.updateRestarting).toBe(false)
+      await act(async () => store.restartApp())
+      expect(ipc.updateRestart).toHaveBeenCalledTimes(2)
+      expect(store.error).toBeNull()
+    },
+  )
+
+  it('rejects restarting during a pending session start before reaching backend', async () => {
+    await installedUpdate()
+    const starting = deferred<TaskStatus>()
+    ipc.sessionStart.mockReturnValueOnce(starting.promise)
+    let toggle!: Promise<void>
+    await act(async () => {
+      toggle = store.toggleSession()
+    })
+    await act(async () => store.restartApp())
+    expect(ipc.updateRestart).not.toHaveBeenCalled()
+    expect(store.updatePhase).toBe('ready')
+    expect(store.error).toContain('等待会话收尾')
+    await act(async () => {
+      starting.resolve(TaskStatus.Capturing)
+      await toggle
+    })
   })
 
   it('unsubscribes all session and window events on unmount', async () => {

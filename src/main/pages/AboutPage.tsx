@@ -13,8 +13,10 @@ export function AboutPage() {
     info,
     setError,
     status,
+    pending,
     updateInfo,
     updatePhase,
+    updateRestarting,
     updateProgress,
     updateError,
     installedVersion,
@@ -73,7 +75,8 @@ export function AboutPage() {
     }
     if (updatePhase === 'ready') {
       const version = installedVersion ?? updateInfo?.version ?? ''
-      return capturing ? `已安装 v${version}，请先停止转写再重启` : `已安装 v${version}，重启应用后生效`
+      if (updateRestarting) return '正在保存设置并重启应用…'
+      return capturing || pending ? `已安装 v${version}，请等待转写停止后再重启` : `已安装 v${version}，重启应用后生效`
     }
     if (updatePhase === 'error') return `更新失败：${updateError ?? '未知错误'}`
     if (updatePhase === 'checking') return '正在检查最新版本…'
@@ -106,7 +109,14 @@ export function AboutPage() {
                 <Mono>{percent == null ? '下载中' : `${percent}%`}</Mono>
               </div>
             ) : updatePhase === 'ready' ? (
-              <Button size="sm" variant="primary" icon="refresh" onClick={() => void restartApp()} disabled={capturing}>
+              <Button
+                size="sm"
+                variant="primary"
+                icon="refresh"
+                onClick={() => void restartApp()}
+                disabled={capturing || pending}
+                pending={updateRestarting}
+              >
                 重启
               </Button>
             ) : updateInfo?.available ? (
@@ -115,7 +125,7 @@ export function AboutPage() {
                 variant="primary"
                 icon="download"
                 onClick={() => void installUpdate()}
-                disabled={!updaterEnabled || capturing || updatePhase === 'checking'}
+                disabled={!updaterEnabled || capturing || pending || updatePhase === 'checking'}
               >
                 下载并安装
               </Button>

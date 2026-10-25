@@ -6,11 +6,11 @@ pub mod panel;
 #[cfg(target_os = "macos")]
 pub mod watchdog;
 
-use std::sync::Mutex;
+use std::sync::{Mutex, TryLockError};
 
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
-use crate::config::{MAX_OVERLAY_HEIGHT, MIN_OVERLAY_HEIGHT, OverlayConfig, OverlayMode};
+use crate::config::{OverlayConfig, OverlayMode, MAX_OVERLAY_HEIGHT, MIN_OVERLAY_HEIGHT};
 
 pub const LABEL: &str = "overlay";
 
@@ -24,6 +24,7 @@ pub const EVENT_OVERLAY_VISIBILITY: &str = "overlay://visibility";
 pub struct OverlayState {
     config: Mutex<OverlayConfig>,
     applied_click_through: Mutex<Option<bool>>,
+    write_lock: Mutex<()>,
 }
 
 impl OverlayState {
@@ -44,20 +45,6 @@ impl OverlayState {
 
     fn replace(&self, cfg: OverlayConfig) {
         *self.config.lock().expect("overlay config mutex poisoned") = cfg;
-    }
-
-    fn set_mode(&self, mode: OverlayMode) {
-        self.config
-            .lock()
-            .expect("overlay config mutex poisoned")
-            .mode = mode;
-    }
-
-    fn set_enable(&self, enable: bool) {
-        self.config
-            .lock()
-            .expect("overlay config mutex poisoned")
-            .enable = enable;
     }
 
     fn needs_click_through_write(&self, want: bool) -> bool {
@@ -190,17 +177,27 @@ pub(crate) fn set_geometry(
 
 pub fn toggle(app: &AppHandle) -> Result<bool, String> {
     let frame = Frame::get(app)?;
-    let visible = frame.is_visible();
-
-    if visible {
-        frame.hide()?;
-    } else {
-        frame.show()?;
-        apply_fullscreen_overlay(app, &frame);
-    }
-
-    let now = !visible;
-    set_enable(app, now);
+    let state = app.state::<OverlayState>();
+    let cfg = save_and_apply_config(
+        &state,
+        |previous| OverlayConfig {
+            enable: !frame.is_visible(),
+            ..previous.clone()
+        },
+        |cfg| persist_config(app, cfg),
+        |_, cfg| {
+            if cfg.enable {
+                frame.show()?;
+                apply_fullscreen_overlay(app, &frame);
+            } else {
+                frame.hide()?;
+            }
+            crate::tray::sync_visibility(app, cfg.enable);
+            Ok(())
+        },
+    )?;
+    let now = cfg.enable;
+    broadcast(app, &state);
     broadcast_visibility(app, now);
     crate::telemetry::track(
         app,
@@ -209,16 +206,6 @@ pub fn toggle(app: &AppHandle) -> Result<bool, String> {
     );
 
     Ok(now)
-}
-
-fn set_enable(app: &AppHandle, enable: bool) {
-    let state = app.state::<OverlayState>();
-    state.set_enable(enable);
-    if let Err(e) = crate::prefs::update(app, |p| p.overlay.enable = enable) {
-        tracing::error!("悬浮窗可见性保存失败：{e}（重启后会回到上次落盘的状态）");
-    }
-    crate::tray::sync_visibility(app, enable);
-    broadcast(app, &state);
 }
 
 pub fn is_visible(app: &AppHandle) -> bool {
@@ -246,17 +233,25 @@ fn apply_mode(app: &AppHandle, mode: OverlayMode) -> Result<(), String> {
         }
     }
 
-    state.set_mode(mode);
     Ok(())
 }
 
 pub fn set_mode(app: &AppHandle, mode: OverlayMode) -> Result<OverlayMode, String> {
-    apply_mode(app, mode)?;
-    if let Err(e) = crate::prefs::update(app, |p| p.overlay.mode = mode) {
-        tracing::error!("悬浮窗交互模式保存失败：{e}（重启后会回到上次落盘的模式）");
-    }
-    crate::tray::sync_mode(app, mode);
-    broadcast(app, &app.state::<OverlayState>());
+    let state = app.state::<OverlayState>();
+    save_and_apply_config(
+        &state,
+        |previous| OverlayConfig {
+            mode,
+            ..previous.clone()
+        },
+        |cfg| persist_config(app, cfg),
+        |_, _| {
+            apply_mode(app, mode)?;
+            crate::tray::sync_mode(app, mode);
+            Ok(())
+        },
+    )?;
+    broadcast(app, &state);
     Ok(mode)
 }
 
@@ -265,30 +260,54 @@ pub fn config(app: &AppHandle) -> OverlayConfig {
 }
 
 pub fn set_config(app: &AppHandle, cfg: OverlayConfig) -> Result<OverlayConfig, String> {
-    let cfg = cfg.sanitized();
     let state = app.state::<OverlayState>();
-    let previous = state.config();
-
-    if cfg.mode != state.mode() {
-        apply_mode(app, cfg.mode)?;
-    }
-
-    #[cfg(target_os = "macos")]
-    if !cfg.always_on_top {
-        tracing::warn!(
-            "always_on_top=false 在 macOS 上不被采纳：跨全屏置顶依赖强制的 NSScreenSaverWindowLevel"
-        );
-    }
-
-    state.replace(cfg.clone());
-    crate::tray::sync_mode(app, cfg.mode);
-    if previous.font_size != cfg.font_size || previous.max_lines != cfg.max_lines {
-        fit_height_to_lines(app, &cfg);
-    }
-    if let Err(e) = crate::prefs::update(app, |p| p.overlay = cfg.clone()) {
-        tracing::error!("悬浮窗配置保存失败，本次调整不会被记住：{e}");
-    }
+    let cfg = save_and_apply_config(
+        &state,
+        |_| cfg,
+        |cfg| persist_config(app, cfg),
+        |previous, cfg| {
+            if cfg.mode != previous.mode {
+                apply_mode(app, cfg.mode)?;
+            }
+            #[cfg(target_os = "macos")]
+            if !cfg.always_on_top {
+                tracing::warn!(
+                    "always_on_top=false 在 macOS 上不被采纳：跨全屏置顶依赖强制的 NSScreenSaverWindowLevel"
+                );
+            }
+            crate::tray::sync_mode(app, cfg.mode);
+            if previous.font_size != cfg.font_size || previous.max_lines != cfg.max_lines {
+                fit_height_to_lines(app, cfg);
+            }
+            Ok(())
+        },
+    )?;
     broadcast(app, &state);
+    Ok(cfg)
+}
+
+fn persist_config(app: &AppHandle, cfg: &OverlayConfig) -> Result<(), String> {
+    crate::prefs::update(app, |p| p.overlay = cfg.clone()).map(|_| ())
+}
+
+fn save_and_apply_config(
+    state: &OverlayState,
+    change: impl FnOnce(&OverlayConfig) -> OverlayConfig,
+    save: impl FnOnce(&OverlayConfig) -> Result<(), String>,
+    apply: impl FnOnce(&OverlayConfig, &OverlayConfig) -> Result<(), String>,
+) -> Result<OverlayConfig, String> {
+    // 原生调用可能等待主线程；主线程入口不能阻塞等待另一写操作。
+    let _write = match state.write_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(TryLockError::WouldBlock) => return Err("悬浮窗设置正在保存，请稍后重试".into()),
+    };
+    let previous = state.config();
+    let cfg = change(&previous).sanitized();
+    save(&cfg).map_err(|error| format!("悬浮窗配置保存失败，本次调整未应用：{error}"))?;
+    apply(&previous, &cfg)
+        .map_err(|error| format!("悬浮窗配置已保存，但未完全应用，请重试：{error}"))?;
+    state.replace(cfg.clone());
     Ok(cfg)
 }
 
@@ -505,9 +524,139 @@ pub fn debug_state(app: &AppHandle) -> Result<serde_json::Value, String> {
 mod tests {
     use super::*;
 
+    struct SavedConfig {
+        directory: std::path::PathBuf,
+        path: std::path::PathBuf,
+        original: crate::config::Preferences,
+        state: OverlayState,
+    }
+
+    impl SavedConfig {
+        fn new() -> Self {
+            let directory =
+                std::env::temp_dir().join(format!("overlay-save-{}", uuid::Uuid::new_v4()));
+            let path = directory.join("preferences.json");
+            let original = crate::config::Preferences {
+                source_lang: "zh".into(),
+                ..Default::default()
+            };
+            crate::prefs::save_to(&path, &original).unwrap();
+            let state = OverlayState::default();
+            state.replace(original.overlay.clone());
+            Self {
+                directory,
+                path,
+                original,
+                state,
+            }
+        }
+
+        fn save(&self, cfg: &OverlayConfig) -> Result<(), String> {
+            let mut prefs = crate::prefs::load_from(&self.path);
+            prefs.overlay = cfg.clone();
+            crate::prefs::save_to(&self.path, &prefs)
+        }
+    }
+
+    impl Drop for SavedConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
     #[test]
     fn lines_height_matches_the_css_budget() {
         assert!((lines_height(22, 6) - (22.0 * 1.35 * 6.0 + 16.0)).abs() < 1e-9);
         assert!(lines_height(48, 20) > lines_height(22, 6));
+    }
+
+    #[test]
+    fn real_save_failures_leave_visibility_mode_and_style_unchanged_and_can_be_retried() {
+        for change in ["visibility", "mode", "style"] {
+            let fixture = SavedConfig::new();
+            let before = std::fs::read(&fixture.path).unwrap();
+            let obstruction = fixture.path.with_extension("json.tmp");
+            std::fs::create_dir(&obstruction).unwrap();
+            let mut target = fixture.original.overlay.clone();
+            match change {
+                "visibility" => target.enable = !target.enable,
+                "mode" => target.mode = OverlayMode::Locked,
+                _ => target.font_size = 30,
+            }
+            let failed = save_and_apply_config(
+                &fixture.state,
+                |_| target.clone(),
+                |cfg| fixture.save(cfg),
+                |_, _| panic!("保存失败后不应应用原生窗口、托盘或内存状态"),
+            );
+            assert!(failed.unwrap_err().contains("保存失败，本次调整未应用"));
+            assert_eq!(fixture.state.config(), fixture.original.overlay);
+            assert_eq!(std::fs::read(&fixture.path).unwrap(), before);
+
+            std::fs::remove_dir(&obstruction).unwrap();
+            let mut applied = false;
+            let saved = save_and_apply_config(
+                &fixture.state,
+                |_| target.clone(),
+                |cfg| fixture.save(cfg),
+                |previous, cfg| {
+                    assert_eq!(previous, &fixture.original.overlay);
+                    assert_eq!(crate::prefs::load_from(&fixture.path).overlay, *cfg);
+                    applied = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(applied);
+            assert_eq!(saved, target);
+            assert_eq!(fixture.state.config(), target);
+            let loaded = crate::prefs::load_from(&fixture.path);
+            assert_eq!(loaded.overlay, target);
+            assert_eq!(loaded.source_lang, fixture.original.source_lang);
+        }
+    }
+
+    #[test]
+    fn native_apply_failure_returns_a_retryable_error_after_a_real_successful_save() {
+        let fixture = SavedConfig::new();
+        let target = OverlayConfig {
+            mode: OverlayMode::Locked,
+            ..fixture.original.overlay.clone()
+        };
+        let result = save_and_apply_config(
+            &fixture.state,
+            |_| target.clone(),
+            |cfg| fixture.save(cfg),
+            |_, _| Err("窗口暂不可用".into()),
+        );
+        assert!(result
+            .unwrap_err()
+            .contains("配置已保存，但未完全应用，请重试"));
+        assert_eq!(crate::prefs::load_from(&fixture.path).overlay, target);
+        assert_eq!(fixture.state.config(), fixture.original.overlay);
+        save_and_apply_config(
+            &fixture.state,
+            |_| target.clone(),
+            |cfg| fixture.save(cfg),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(fixture.state.config(), target);
+        assert_eq!(crate::prefs::load_from(&fixture.path).overlay, target);
+    }
+
+    #[test]
+    fn concurrent_or_reentrant_window_writes_fail_without_blocking_the_main_thread() {
+        let fixture = SavedConfig::new();
+        let _writing = fixture.state.write_lock.lock().unwrap();
+        let result = save_and_apply_config(
+            &fixture.state,
+            |_| panic!("并发修改不能读取并覆盖正在保存的设置"),
+            |_| panic!("并发修改不能保存"),
+            |_, _| panic!("并发修改不能应用"),
+        );
+        assert_eq!(result, Err("悬浮窗设置正在保存，请稍后重试".into()));
+        assert_eq!(fixture.state.config(), fixture.original.overlay);
+        assert_eq!(crate::prefs::load_from(&fixture.path), fixture.original);
     }
 }
