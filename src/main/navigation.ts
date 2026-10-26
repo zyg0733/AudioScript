@@ -1,6 +1,15 @@
 import type { SidebarItem } from '@/ui/Sidebar'
 
-export type PageId = 'transcribe' | 'audio' | 'permissions' | 'translate' | 'overlay' | 'general' | 'models' | 'about'
+export type PageId =
+  | 'transcribe'
+  | 'library'
+  | 'audio'
+  | 'permissions'
+  | 'translate'
+  | 'overlay'
+  | 'general'
+  | 'models'
+  | 'about'
 
 export const NAV: SidebarItem<PageId>[] = [
   {
@@ -8,6 +17,7 @@ export const NAV: SidebarItem<PageId>[] = [
     label: '转写',
     icon: 'waveform',
   },
+  { id: 'library', label: '资料库', icon: 'folder' },
   {
     id: 'audio',
     label: '音频',

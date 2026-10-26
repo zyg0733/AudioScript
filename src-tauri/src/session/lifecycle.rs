@@ -1,3 +1,5 @@
+use super::{SessionActions, SessionPhase};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum Status {
     #[default]
@@ -15,6 +17,7 @@ pub(super) enum Failure<T> {
 pub(super) enum ExclusiveOperation {
     Update,
     Restart,
+    Processing,
 }
 
 pub(super) struct Lifecycle<T> {
@@ -42,17 +45,28 @@ impl<T> Default for Lifecycle<T> {
 }
 
 impl<T> Lifecycle<T> {
-    pub(super) fn begin(&mut self) -> Result<u64, &'static str> {
+    fn ensure_startable(&self, teardown_active: bool) -> Result<(), &'static str> {
         match self.exclusive_operation {
             Some(ExclusiveOperation::Update) => {
                 return Err("正在下载或安装更新，无法开始转写");
             }
             Some(ExclusiveOperation::Restart) => return Err("应用正在重启，无法开始转写"),
+            Some(ExclusiveOperation::Processing) => {
+                return Err("正在处理资料，请等待完成后再开始转写")
+            }
             None => {}
+        }
+        if teardown_active {
+            return Err("会话仍在收尾，请等待末句与译文完成");
         }
         if self.active_epoch.is_some() || self.initializing_epoch.is_some() {
             return Err("会话正在启动或采集中");
         }
+        Ok(())
+    }
+
+    pub(super) fn begin(&mut self) -> Result<u64, &'static str> {
+        self.ensure_startable(false)?;
         self.next_epoch += 1;
         self.active_epoch = Some(self.next_epoch);
         self.initializing_epoch = self.active_epoch;
@@ -69,16 +83,17 @@ impl<T> Lifecycle<T> {
         match self.exclusive_operation {
             Some(ExclusiveOperation::Update) => return Err("正在下载或安装更新，请稍候"),
             Some(ExclusiveOperation::Restart) => return Err("应用正在重启，请稍候"),
+            Some(ExclusiveOperation::Processing) => return Err("正在处理资料，请等待完成后再操作"),
             None => {}
         }
         if self.initializing_epoch.is_some() {
-            return Err("会话仍在启动，请等待启动结束后再更新或重启");
+            return Err("会话仍在启动，请等待启动结束后再操作");
         }
         if self.active_epoch.is_some() {
-            return Err("请先停止转写，再安装更新或重启");
+            return Err("请先停止转写，再处理资料或更改应用状态");
         }
         if teardown_active {
-            return Err("会话仍在收尾，请等待转写和翻译完成后再更新或重启");
+            return Err("会话仍在收尾，请等待转写和翻译完成后再操作");
         }
         self.exclusive_operation = Some(operation);
         Ok(())
@@ -110,13 +125,15 @@ impl<T> Lifecycle<T> {
         Failure::Accepted(self.running.take())
     }
 
-    pub(super) fn abort_start(&mut self, epoch: u64) {
-        if self.initializing_epoch == Some(epoch) {
+    pub(super) fn abort_start(&mut self, epoch: u64) -> bool {
+        let initializing = self.initializing_epoch == Some(epoch);
+        if initializing {
             self.initializing_epoch = None;
         }
         if self.active_epoch == Some(epoch) && self.running.is_none() {
             self.active_epoch = None;
         }
+        initializing
     }
 
     pub(super) fn stop(&mut self) -> Option<T> {
@@ -138,7 +155,42 @@ impl<T> Lifecycle<T> {
         self.running.as_ref()
     }
 
+    pub(super) fn view(&self, teardown_active: bool) -> (SessionPhase, SessionActions) {
+        let phase = if teardown_active {
+            SessionPhase::Finalizing
+        } else if self.initializing_epoch.is_some() {
+            SessionPhase::Preparing
+        } else if self.exclusive_operation == Some(ExclusiveOperation::Processing) {
+            SessionPhase::Processing
+        } else {
+            match self.status {
+                Status::Ready => SessionPhase::Ready,
+                Status::Capturing => SessionPhase::Capturing,
+                Status::Error => SessionPhase::Error,
+            }
+        };
+        let reason = if teardown_active {
+            Some("正在整理末句与译文，请稍候")
+        } else if self.initializing_epoch.is_some() {
+            Some("正在准备识别与翻译，请等待启动完成")
+        } else {
+            self.ensure_startable(false).err()
+        };
+        let actions = SessionActions {
+            can_start: self.ensure_startable(teardown_active).is_ok(),
+            can_stop: self.running.is_some(),
+            can_clear: self.ensure_clearable(teardown_active).is_ok(),
+            can_export: !teardown_active
+                && self.exclusive_operation != Some(ExclusiveOperation::Processing),
+            reason: reason.map(str::to_owned),
+        };
+        (phase, actions)
+    }
+
     pub(super) fn ensure_clearable(&self, teardown_active: bool) -> Result<(), &'static str> {
+        if self.exclusive_operation == Some(ExclusiveOperation::Processing) {
+            return Err("正在处理资料，暂时不能清空");
+        }
         if self.initializing_epoch.is_some() {
             return Err("会话仍在启动，请等待启动结束后再清空");
         }
@@ -155,6 +207,104 @@ impl<T> Lifecycle<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_and_actions_follow_preparation_capture_and_finalization() {
+        let mut state = Lifecycle::<()>::default();
+        let (phase, actions) = state.view(false);
+        assert_eq!(phase, SessionPhase::Ready);
+        assert!(actions.can_start && actions.can_clear && actions.can_export);
+        assert!(!actions.can_stop);
+        assert!(actions.reason.is_none());
+
+        let epoch = state.begin().unwrap();
+        let (phase, actions) = state.view(false);
+        assert_eq!(state.status(), Status::Ready);
+        assert_eq!(phase, SessionPhase::Preparing);
+        assert!(!actions.can_start && !actions.can_stop && !actions.can_clear);
+        assert!(actions.can_export, "准备期间仍可导出先前的定稿");
+        assert!(actions.reason.is_some());
+
+        state.publish(epoch, ()).unwrap();
+        let (phase, actions) = state.view(false);
+        assert_eq!(phase, SessionPhase::Capturing);
+        assert!(actions.can_stop && actions.can_export);
+        assert!(!actions.can_start && !actions.can_clear);
+
+        assert!(state.stop().is_some());
+        let (phase, actions) = state.view(true);
+        assert_eq!(state.status(), Status::Ready);
+        assert_eq!(phase, SessionPhase::Finalizing);
+        assert!(
+            !actions.can_start && !actions.can_stop && !actions.can_clear && !actions.can_export
+        );
+
+        let (phase, actions) = state.view(false);
+        assert_eq!(phase, SessionPhase::Ready);
+        assert!(actions.can_start && actions.can_clear && actions.can_export);
+    }
+
+    #[test]
+    fn cancelled_preparation_remains_busy_until_initialization_exits() {
+        let mut state = Lifecycle::<()>::default();
+        let epoch = state.begin().unwrap();
+        assert!(state.stop().is_none());
+        assert_eq!(state.status(), Status::Ready);
+        let (phase, actions) = state.view(false);
+        assert_eq!(phase, SessionPhase::Preparing);
+        assert!(!actions.can_start && !actions.can_stop && !actions.can_clear);
+        assert!(state.abort_start(epoch));
+        assert_eq!(state.view(false).0, SessionPhase::Ready);
+        assert!(state.view(false).1.can_start);
+    }
+
+    #[test]
+    fn failed_capture_is_finalizing_until_resources_are_released() {
+        let mut state = Lifecycle::<()>::default();
+        let epoch = state.begin().unwrap();
+        state.publish(epoch, ()).unwrap();
+        assert!(matches!(
+            state.fail(epoch, "设备断开".into()),
+            Failure::Accepted(Some(()))
+        ));
+        assert_eq!(state.status(), Status::Error);
+        assert_eq!(state.view(true).0, SessionPhase::Finalizing);
+        assert!(!state.view(true).1.can_start);
+        let (phase, actions) = state.view(false);
+        assert_eq!(phase, SessionPhase::Error);
+        assert!(actions.can_start && actions.can_clear && actions.can_export);
+        assert_eq!(state.error(), Some("设备断开"));
+    }
+
+    #[test]
+    fn exclusive_actions_only_restrict_the_actions_the_backend_rejects() {
+        for operation in [ExclusiveOperation::Update, ExclusiveOperation::Restart] {
+            let mut state = Lifecycle::<()>::default();
+            state.reserve_exclusive(operation, false).unwrap();
+            let (phase, actions) = state.view(false);
+            assert_eq!(phase, SessionPhase::Ready);
+            assert!(!actions.can_start && !actions.can_stop);
+            assert!(actions.can_clear && actions.can_export);
+            assert!(actions.reason.is_some());
+            state.release_exclusive(operation);
+            assert!(state.view(false).1.can_start);
+            assert!(state.view(false).1.reason.is_none());
+        }
+    }
+
+    #[test]
+    fn late_abort_and_failure_cannot_change_a_new_preparation_view() {
+        let mut state = Lifecycle::<()>::default();
+        let old = state.begin().unwrap();
+        assert!(state.abort_start(old));
+        let current = state.begin().unwrap();
+        let expected = state.view(false);
+        assert!(!state.abort_start(old));
+        assert!(matches!(state.fail(old, "旧故障".into()), Failure::Stale));
+        assert_eq!(state.view(false), expected);
+        state.publish(current, ()).unwrap();
+        assert_eq!(state.view(false).0, SessionPhase::Capturing);
+    }
 
     #[test]
     fn failed_start_can_be_retried() {

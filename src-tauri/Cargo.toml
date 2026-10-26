@@ -26,7 +26,7 @@ tauri-build = { version = "2", features = [] }
 dunce = "1"
 # ⚠️ macos-private-api 是 tauri-nspanel 换 NSPanel 的前提，代价是无法上架 Mac App Store
 # （本项目走 GitHub Releases 分发，可接受）。
-tauri = { version = "2.12", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri = { version = "2.12", features = ["tray-icon", "image-png", "macos-private-api", "protocol-asset"] }
 
 # ⚠️ 必须第一个注册，否则会有两个托盘图标、两条音频管线。
 tauri-plugin-single-instance = "2"
@@ -52,6 +52,7 @@ sherpa-onnx = "1.13"
 
 # ct2rs 的 Tokenizer trait 以 anyhow::Result 为返回类型。
 anyhow = "1"
+base64 = "0.22"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -132,6 +133,5 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
-base64 = "0.22"
 minisign-verify = "0.3"
 semver = "1"

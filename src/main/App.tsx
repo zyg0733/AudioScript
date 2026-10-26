@@ -11,6 +11,7 @@ import { NAV, type PageId } from './navigation'
 import { AboutPage } from './pages/AboutPage'
 import { AudioPage } from './pages/AudioPage'
 import { GeneralPage } from './pages/GeneralPage'
+import { LibraryPage } from './pages/LibraryPage'
 import { ModelsPage } from './pages/ModelsPage'
 import { OverlayPage } from './pages/OverlayPage'
 import { PermissionsPage } from './pages/PermissionsPage'
@@ -39,6 +40,9 @@ function BootSplash() {
     <main className="flex h-full">
       <section className="flex min-w-0 flex-1 flex-col bg-[var(--color-surface-0)]">
         <TitleBarSpacer />
+        <p role="status" className="m-auto text-[var(--color-ink-2)] text-sm">
+          正在读取设置…
+        </p>
       </section>
     </main>
   )
@@ -46,6 +50,7 @@ function BootSplash() {
 
 function Shell() {
   const [page, setPage] = useState<PageId>('transcribe')
+  const [recordId, setRecordId] = useState<string | undefined>()
   const { status, updatePhase, updateRestarting } = useStore()
   const capturing = status === TaskStatus.Capturing
   const updating = updatePhase === 'downloading' || updateRestarting
@@ -61,7 +66,15 @@ function Shell() {
 
         <div className="flex-1 overflow-y-auto">
           <fieldset disabled={updating} className="m-0 min-w-0 border-0 p-0">
-            <PageSwitch page={page} onOpenPermissions={() => setPage('permissions')} />
+            <PageSwitch
+              page={page}
+              recordId={recordId}
+              onOpenLibrary={(id) => {
+                setRecordId(id)
+                setPage('library')
+              }}
+              onOpenPermissions={() => setPage('permissions')}
+            />
           </fieldset>
         </div>
 
@@ -76,14 +89,20 @@ function Shell() {
 }
 
 function PrimaryActionSlot() {
-  const { status, pending, activeDevice, toggleSession, updatePhase, updateRestarting } = useStore()
+  const { status, sessionInfo, pending, activeDevice, toggleSession, updatePhase, updateRestarting } = useStore()
   const capturing = status === TaskStatus.Capturing
+  const canToggle = capturing ? sessionInfo?.actions.canStop : sessionInfo?.actions.canStart
   return (
     <PrimaryAction
       capturing={capturing}
       pending={pending}
+      phase={sessionInfo?.phase}
       disabledReason={
-        !capturing && (updatePhase === 'downloading' || updateRestarting) ? '正在更新，暂不可开始转写' : undefined
+        !capturing && (updatePhase === 'downloading' || updateRestarting)
+          ? '正在更新，暂不可开始转写'
+          : !canToggle
+            ? (sessionInfo?.actions.reason ?? '正在读取会话状态…')
+            : undefined
       }
       activeDevice={activeDevice}
       onToggle={() => void toggleSession()}
@@ -92,14 +111,18 @@ function PrimaryActionSlot() {
 }
 
 interface PageSwitchProps {
+  recordId?: string
+  onOpenLibrary: (id: string) => void
   page: PageId
   onOpenPermissions: () => void
 }
 
-function PageSwitch({ page, onOpenPermissions }: PageSwitchProps) {
+function PageSwitch({ page, recordId, onOpenLibrary, onOpenPermissions }: PageSwitchProps) {
   switch (page) {
     case 'transcribe':
-      return <TranscribePage />
+      return <TranscribePage onOpenLibrary={onOpenLibrary} />
+    case 'library':
+      return <LibraryPage initialRecordId={recordId} />
     case 'audio':
       return <AudioPage onOpenPermissions={onOpenPermissions} />
     case 'permissions':
@@ -126,6 +149,8 @@ interface AlertsProps {
 function Alerts({ page, onOpenPermissions, onOpenAbout }: AlertsProps) {
   const {
     error,
+    sessionInfo,
+    refreshSession,
     setError,
     hotkeyProblems,
     audio,
@@ -139,6 +164,13 @@ function Alerts({ page, onOpenPermissions, onOpenAbout }: AlertsProps) {
 
   return (
     <>
+      {!sessionInfo && (
+        <Alert tone="info" title="会话状态尚未同步">
+          <Button size="sm" onClick={() => void refreshSession()}>
+            重新读取会话状态
+          </Button>
+        </Alert>
+      )}
       {(updatePhase === 'downloading' || updateRestarting) && (
         <Alert tone="info" title="正在更新，设置暂不可修改">
           请等待安装或重启完成。

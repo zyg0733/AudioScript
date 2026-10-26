@@ -481,6 +481,13 @@ ready ──▶ capturing ──▶ transcribing ──▶ finished
 
 V0.1 实现到 `capturing`（另有 `error`）。任务状态 MUST 由 Rust 侧持有；托盘图标 MUST 反映后台任务状态。
 
+**会话阶段与可用动作（2026-10-26 补充）**：为兼容现有事件和命令，`TaskStatus` 保留 `ready | capturing | error`。`session_status` 额外返回 `phase: ready | preparing | capturing | finalizing | processing | error` 和 `actions: { canStart, canStop, canClear, canExport, reason? }`，由 Rust 根据初始化、资源收尾和独占操作派生。`ready` MUST NOT 被前端解释为所有动作均已可用。
+
+- 主窗口和托盘 MUST 按同一份阶段与动作权限展示。准备和收尾期间不开放新的启动操作；本轮不增加启动取消交互。
+- `transcript://state` 仍携带 `TaskStatus`，阶段或动作变化时即使状态枚举不变也 MUST 通知；前端收到后重新读取 `session_status`，MUST NOT 忽略重复枚举值。
+- 会话快照未知时，前端 MUST 暂停启动、完整导出、清空、更新安装与重启，并保留独立于可关闭错误条的重新读取入口。
+- 采集中导出当前定稿快照的既有能力保留；资源收尾期间 MUST 禁止导出，直到末句和尾句翻译完成。
+
 正常停止 MUST 先停止音频生产者，再读取库内缓冲及重采样尾块，最后冲刷 ASR。已显示的末句即使没有新的识别结果，也 MUST 以同一 `id`、递增 `revision` 定稿；冲刷用的补零 MUST NOT 计入段落时间。停止可取消已有的积压翻译，但 MUST 保留尾部音频新增定稿的翻译，直到采集线程退出后才关闭翻译队列。简繁转换 MUST 对实时与停止定稿使用同一规则。
 
 ### 7.2 后台常驻

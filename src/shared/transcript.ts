@@ -4,6 +4,7 @@ const INDEX_THRESHOLD = 8
 
 export function mergeDelta(prev: TranscriptSegment[], delta: TranscriptSegment[]): TranscriptSegment[] {
   const next = [...prev]
+  let changed = false
   const idx = delta.length > INDEX_THRESHOLD ? new Map(next.map((s, i) => [s.id, i])) : null
 
   for (const seg of delta) {
@@ -22,9 +23,11 @@ export function mergeDelta(prev: TranscriptSegment[], delta: TranscriptSegment[]
     if (at === undefined) {
       idx?.set(seg.id, next.length)
       next.push(seg)
+      changed = true
     } else if (seg.revision > next[at].revision) {
       next[at] = seg
+      changed = true
     }
   }
-  return next
+  return changed ? next : prev
 }

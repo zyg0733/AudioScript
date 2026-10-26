@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '@/main/store'
 import { formatCmdError, type ModelsList, modelsList, openRepo, openUrl } from '@/shared/ipc'
-import { ModelKind, TaskStatus } from '@/shared/types'
+import { ModelKind, SessionPhase, TaskStatus } from '@/shared/types'
 import { Button } from '@/ui/Button'
 import { Icon } from '@/ui/Icon'
 import { Page } from '@/ui/Page'
@@ -13,6 +13,7 @@ export function AboutPage() {
     info,
     setError,
     status,
+    sessionInfo,
     pending,
     updateInfo,
     updatePhase,
@@ -60,6 +61,13 @@ export function AboutPage() {
   }
 
   const capturing = status === TaskStatus.Capturing
+  const sessionBusy =
+    !sessionInfo ||
+    capturing ||
+    pending ||
+    sessionInfo.phase === SessionPhase.Preparing ||
+    sessionInfo.phase === SessionPhase.Finalizing ||
+    sessionInfo.phase === SessionPhase.Processing
   const updaterEnabled = info?.updaterEnabled === true && updateInfo?.enabled !== false
   const percent =
     updateProgress?.total != null
@@ -76,11 +84,13 @@ export function AboutPage() {
     if (updatePhase === 'ready') {
       const version = installedVersion ?? updateInfo?.version ?? ''
       if (updateRestarting) return '正在保存设置并重启应用…'
-      return capturing || pending ? `已安装 v${version}，请等待转写停止后再重启` : `已安装 v${version}，重启应用后生效`
+      if (!sessionInfo) return `已安装 v${version}，确认会话状态后可重启`
+      return sessionBusy ? `已安装 v${version}，请等待转写收尾完成后再重启` : `已安装 v${version}，重启应用后生效`
     }
     if (updatePhase === 'error') return `更新失败：${updateError ?? '未知错误'}`
     if (updatePhase === 'checking') return '正在检查最新版本…'
     if (updateInfo?.available) {
+      if (!sessionInfo) return '发现新版本，确认会话状态后可更新'
       return capturing ? '发现新版本，请先停止转写再更新' : `发现新版本 v${updateInfo.version}`
     }
     if (updateInfo) return `已是最新版本（v${updateInfo.currentVersion}）`
@@ -114,7 +124,7 @@ export function AboutPage() {
                 variant="primary"
                 icon="refresh"
                 onClick={() => void restartApp()}
-                disabled={capturing || pending}
+                disabled={sessionBusy}
                 pending={updateRestarting}
               >
                 重启
@@ -125,7 +135,7 @@ export function AboutPage() {
                 variant="primary"
                 icon="download"
                 onClick={() => void installUpdate()}
-                disabled={!updaterEnabled || capturing || pending || updatePhase === 'checking'}
+                disabled={!updaterEnabled || sessionBusy || updatePhase === 'checking'}
               >
                 下载并安装
               </Button>

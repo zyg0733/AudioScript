@@ -46,6 +46,7 @@ pub struct EndpointConfig {
 pub enum EndpointProfile {
     #[default]
     Interpretation,
+    QuickSubtitle,
     Dictation,
 }
 
@@ -55,6 +56,10 @@ impl EndpointConfig {
             EndpointProfile::Interpretation => Self {
                 trailing_silence_ms: 800,
                 max_utterance_ms: 8_000,
+            },
+            EndpointProfile::QuickSubtitle => Self {
+                trailing_silence_ms: 500,
+                max_utterance_ms: 5_000,
             },
             EndpointProfile::Dictation => Self {
                 trailing_silence_ms: 1_200,

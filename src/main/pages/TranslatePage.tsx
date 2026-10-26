@@ -153,6 +153,15 @@ export function TranslatePage() {
             <div className="flex gap-1.5">
               <button
                 type="button"
+                disabled={busy || !defaults?.endpointProfiles.quickSubtitle}
+                title="500ms 静音定稿，最长5秒；译文更早出现，但句子可能更碎。"
+                onClick={() => defaults && void setEndpoint(defaults.endpointProfiles.quickSubtitle)}
+                className="rounded-[var(--radius-ctl)] border border-[var(--color-border-subtle)] px-2 py-1 text-[var(--color-ink-1)] text-xs transition hover:bg-[var(--color-surface-2)] disabled:opacity-40"
+              >
+                及时字幕
+              </button>
+              <button
+                type="button"
                 disabled={busy || !defaults}
                 onClick={() => defaults && void setEndpoint(defaults.endpointProfiles.interpretation)}
                 className="rounded-[var(--radius-ctl)] border border-[var(--color-border-subtle)] px-2 py-1 text-[var(--color-ink-1)] text-xs transition hover:bg-[var(--color-surface-2)] disabled:opacity-40"

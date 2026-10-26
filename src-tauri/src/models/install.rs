@@ -319,9 +319,10 @@ pub fn remove_model(app: &AppHandle, model_id: &str) -> Result<(), ModelError> {
     if state.is_busy() {
         return Err(ModelError::JobInProgress);
     }
-    if app.state::<crate::session::SessionState>().is_running() {
-        return Err(ModelError::InUse);
-    }
+    let session = app.state::<crate::session::SessionState>();
+    let _guard = session
+        .reserve_processing()
+        .map_err(|_| ModelError::InUse)?;
 
     let root = paths::user_models_root(app)
         .ok_or_else(|| ModelError::Internal("无法解析应用数据目录".into()))?;
@@ -359,10 +360,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("models-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let missing = missing_files(&dir, asr).unwrap();
-        assert!(missing.iter().any(|m| m.starts_with("encoder")), "{missing:?}");
+        assert!(
+            missing.iter().any(|m| m.starts_with("encoder")),
+            "{missing:?}"
+        );
 
         let mt = catalog::entry("mt-big").unwrap();
         let missing = missing_files(&dir, mt).unwrap();
-        assert!(missing.iter().any(|m| m.contains("model.bin")), "{missing:?}");
+        assert!(
+            missing.iter().any(|m| m.contains("model.bin")),
+            "{missing:?}"
+        );
     }
 }

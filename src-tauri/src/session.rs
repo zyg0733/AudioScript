@@ -81,8 +81,6 @@ pub const EVENT_AUDIO: &str = "transcript://audio";
 pub const EVENT_LEVEL: &str = "transcript://level";
 pub const EVENT_ERROR: &str = "transcript://error";
 
-const FIRST_TEXT_BUDGET_MS: u128 = 200;
-
 #[typeshare::typeshare]
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,6 +102,29 @@ pub enum TaskStatus {
     Ready,
     Capturing,
     Error,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionPhase {
+    Ready,
+    Preparing,
+    Capturing,
+    Finalizing,
+    Processing,
+    Error,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionActions {
+    pub can_start: bool,
+    pub can_stop: bool,
+    pub can_clear: bool,
+    pub can_export: bool,
+    pub reason: Option<String>,
 }
 
 impl From<lifecycle::Status> for TaskStatus {
@@ -136,11 +157,12 @@ struct RunningSession {
 
     translation: Option<TranslationSession>,
     traditional_source: bool,
+    timestamp_offset_ms: u64,
     events: Sender<UiEvent>,
 }
 
 enum UiEvent {
-    Status(TaskStatus),
+    StateChanged,
     Failed { epoch: u64, message: String },
     Level(f64),
     Audio(AudioStatus),
@@ -165,10 +187,8 @@ pub fn init_emitter(app: &AppHandle) -> Result<(), String> {
 
                 let t0 = Instant::now();
                 match event {
-                    UiEvent::Status(status) => {
-                        if app.state::<SessionState>().status() == status {
-                            emit_status(&app, status);
-                        }
+                    UiEvent::StateChanged => {
+                        emit_status(&app, app.state::<SessionState>().status())
                     }
                     UiEvent::Failed { epoch, message } => fail_session(&app, epoch, message),
                     UiEvent::Segments(segments) => emit_segments(&app, segments),
@@ -204,6 +224,12 @@ fn events_sender() -> Result<Sender<UiEvent>, String> {
         .ok_or_else(|| "事件线程未初始化".to_string())
 }
 
+fn notify_state_changed() {
+    if let Some(events) = EVENT_SENDER.get() {
+        let _ = events.send(UiEvent::StateChanged);
+    }
+}
+
 enum TranslateCommand {
     Start {
         queue: Arc<JobQueue>,
@@ -236,6 +262,7 @@ fn run_translate_worker(rx: std::sync::mpsc::Receiver<TranslateCommand>) {
     }) = rx.recv()
     {
         while let Some(job) = queue.pop_blocking() {
+            let started = Instant::now();
             let result = translator
                 .lock()
                 .expect("translator mutex poisoned")
@@ -244,13 +271,19 @@ fn run_translate_worker(rx: std::sync::mpsc::Receiver<TranslateCommand>) {
 
             let updated = {
                 let mut s = store.lock().expect("transcript store mutex poisoned");
-                s.set_translation(&job.segment_id, result).ok()
+                s.set_translation_if_revision(&job.segment_id, job.revision, result)
+                    .ok()
+                    .flatten()
             };
 
             if let Some(seg) = updated {
                 match seg.translation_state {
                     TranslationState::Done => {
-                        tracing::info!("[译文] {}", seg.translation.as_deref().unwrap_or(""))
+                        tracing::info!(
+                            id = %seg.id,
+                            translation_ms = started.elapsed().as_millis(),
+                            "段落翻译完成"
+                        )
                     }
                     TranslationState::Failed => {
                         tracing::warn!(id = %seg.id, "[译文] 失败，该段只显示原文")
@@ -271,6 +304,8 @@ fn run_translate_worker(rx: std::sync::mpsc::Receiver<TranslateCommand>) {
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub status: TaskStatus,
+    pub phase: SessionPhase,
+    pub actions: SessionActions,
     pub device: Option<String>,
     pub device_sample_rate: Option<u32>,
     pub error: Option<String>,
@@ -278,11 +313,10 @@ pub struct SessionInfo {
 
 #[derive(Default)]
 pub struct SessionState {
+    shutting_down: AtomicBool,
     store: Arc<Mutex<TranscriptStore>>,
     broadcast: Mutex<()>,
     lifecycle: Mutex<Lifecycle<RunningSession>>,
-    started_at: Mutex<Option<Instant>>,
-    first_text_logged: AtomicBool,
     audio_started_at: Arc<Mutex<Option<Instant>>>,
     teardown_active: AtomicBool,
 }
@@ -299,10 +333,24 @@ impl Drop for OperationGuard<'_> {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .release_exclusive(self.operation);
+        notify_state_changed();
     }
 }
 
 impl SessionState {
+    pub(crate) fn request_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn restore(&self, segments: Vec<TranscriptSegment>) -> Result<(), String> {
+        let mut store = self.store.lock().map_err(|_| "转写存储不可用")?;
+        if !store.snapshot().is_empty() {
+            return Err("已有转写内容，无法覆盖恢复".into());
+        }
+        store.apply(segments).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn reserve_operation(
         &self,
         operation: ExclusiveOperation,
@@ -311,6 +359,7 @@ impl SessionState {
             .lock()
             .expect("session lifecycle mutex poisoned")
             .reserve_exclusive(operation, self.teardown_active.load(Ordering::SeqCst))?;
+        notify_state_changed();
         Ok(OperationGuard {
             state: self,
             operation,
@@ -323,6 +372,10 @@ impl SessionState {
 
     pub(crate) fn reserve_restart(&self) -> Result<OperationGuard<'_>, String> {
         self.reserve_operation(ExclusiveOperation::Restart)
+    }
+
+    pub(crate) fn reserve_processing(&self) -> Result<OperationGuard<'_>, String> {
+        self.reserve_operation(ExclusiveOperation::Processing)
     }
 
     fn clear_with(&self, emit: impl FnOnce(Vec<TranscriptSegment>)) -> Result<(), String> {
@@ -365,35 +418,7 @@ impl SessionState {
                 .collect::<Vec<_>>()
         };
         if !segments.is_empty() {
-            if segments
-                .iter()
-                .any(|segment| !segment.text.trim().is_empty())
-            {
-                self.note_first_text();
-            }
             emit(segments);
-        }
-    }
-
-    fn note_first_text(&self) {
-        if self.first_text_logged.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let t0 = *self
-            .started_at
-            .lock()
-            .expect("session start mutex poisoned");
-        if let Some(t0) = t0 {
-            let ms = t0.elapsed().as_millis();
-            if ms <= FIRST_TEXT_BUDGET_MS {
-                tracing::info!(ms, budget = FIRST_TEXT_BUDGET_MS, "首次出字：达标");
-            } else {
-                tracing::warn!(
-                    ms,
-                    budget = FIRST_TEXT_BUDGET_MS,
-                    "首次出字：**超出预算**（含引擎加载——模型是在点开始时才加载的）"
-                );
-            }
         }
     }
 }
@@ -420,8 +445,12 @@ impl SessionState {
             .lifecycle
             .lock()
             .expect("session lifecycle mutex poisoned");
-        if self.teardown_active.load(Ordering::SeqCst) {
-            return Err("会话仍在收尾，末句与译文尚未完成，请稍后再导出".into());
+        if !_lifecycle
+            .view(self.teardown_active.load(Ordering::SeqCst))
+            .1
+            .can_export
+        {
+            return Err("会话仍在收尾或处理资料，请稍后再导出".into());
         }
         Ok(self.snapshot())
     }
@@ -440,16 +469,21 @@ impl SessionState {
             .lock()
             .expect("session lifecycle mutex poisoned");
         let status = guard.status().into();
+        let (phase, actions) = guard.view(self.teardown_active.load(Ordering::SeqCst));
         let error = guard.error().map(str::to_owned);
         match guard.running() {
             Some(r) => SessionInfo {
                 status,
+                phase,
+                actions,
                 device: Some(r.device.clone()),
                 device_sample_rate: Some(r.device_sample_rate),
                 error,
             },
             None => SessionInfo {
                 status,
+                phase,
+                actions,
                 device: None,
                 device_sample_rate: None,
                 error,
@@ -471,15 +505,20 @@ impl std::fmt::Debug for SessionState {
 struct StartAttempt<'a> {
     state: &'a SessionState,
     epoch: u64,
+    events: Sender<UiEvent>,
 }
 
 impl Drop for StartAttempt<'_> {
     fn drop(&mut self) {
-        self.state
+        let changed = self
+            .state
             .lifecycle
             .lock()
             .expect("session lifecycle mutex poisoned")
             .abort_start(self.epoch);
+        if changed {
+            let _ = self.events.send(UiEvent::StateChanged);
+        }
     }
 }
 
@@ -489,11 +528,15 @@ pub fn start(
     source: audio::AudioSourceKind,
     device: Option<String>,
 ) -> Result<(), String> {
+    let t0 = Instant::now();
     let mut cfg = cfg;
     cfg.translate.target_lang = target_lang_for(&cfg.translate.source_lang).to_owned();
 
     tracing::info!("启动：收到命令");
     let state = app.state::<SessionState>();
+    if state.shutting_down.load(Ordering::SeqCst) {
+        return Err("应用正在退出，无法开始新转写".into());
+    }
 
     if state.is_running() {
         return Err("已在采集中".into());
@@ -511,6 +554,17 @@ pub fn start(
         tracing::info!(ms = waited_ms, "启动前等待上一次收尾完成");
     }
 
+    if let Some(workspace) = app.try_state::<crate::workspace::WorkspaceState>() {
+        if workspace.source_lang() != cfg.translate.source_lang
+            && state
+                .snapshot()
+                .iter()
+                .any(TranscriptSegment::is_persistable)
+        {
+            return Err("当前转写与所选语言不同，请先保存并清空，再开始新语言的转写".into());
+        }
+    }
+    let events = events_sender()?;
     let epoch = {
         let mut lifecycle = state
             .lifecycle
@@ -524,18 +578,14 @@ pub fn start(
     let _attempt = StartAttempt {
         state: &state,
         epoch,
+        events: events.clone(),
     };
 
-    let t0 = Instant::now();
-    *state
-        .started_at
-        .lock()
-        .expect("session start mutex poisoned") = Some(t0);
-    state.first_text_logged.store(false, Ordering::SeqCst);
     *state
         .audio_started_at
         .lock()
         .expect("audio start mutex poisoned") = None;
+    let _ = events.send(UiEvent::StateChanged);
 
     if !matches!(cfg.asr.engine_type, EngineType::LocalStreaming) {
         return Err(format!(
@@ -544,6 +594,9 @@ pub fn start(
         ));
     }
 
+    if let Some(workspace) = app.try_state::<crate::workspace::WorkspaceState>() {
+        workspace.begin_capture(&cfg.translate.source_lang);
+    }
     let prefs = crate::prefs::load(app);
     let asr_entry = catalog::asr_entry(prefs.asr_model_tier);
 
@@ -605,7 +658,6 @@ pub fn start(
 
     let engine: Arc<Mutex<Box<dyn AsrEngine>>> = Arc::new(Mutex::new(Box::new(engine)));
 
-    let events = events_sender()?;
     let translation = match create_translator(app, &cfg.translate, prefs.mt_model_tier)? {
         Some(mut translator) => {
             translator
@@ -653,8 +705,17 @@ pub fn start(
     let mut level_sq = 0.0f64;
     let mut level_n = 0usize;
     let mut level_emit_failed = false;
+    let mut first_text_logged = false;
+    let mut non_silent_started_at = None;
 
     tracing::info!("启动采集");
+    let timestamp_offset_ms = state
+        .snapshot()
+        .iter()
+        .filter(|s| s.is_persistable())
+        .map(|s| s.end_ms)
+        .max()
+        .unwrap_or(0);
     let traditional_source = cfg.translate.source_lang.starts_with("zh")
         && cfg.translate.zh_script == ZhScript::Traditional;
     let audio_clock = Arc::clone(&state.audio_started_at);
@@ -668,6 +729,9 @@ pub fn start(
         }
 
         let sum_sq = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>();
+        if audio::rms(sum_sq, chunk.len()) >= SILENCE_RMS {
+            non_silent_started_at.get_or_insert_with(Instant::now);
+        }
         energy += sum_sq;
         energy_n += chunk.len();
         level_sq += sum_sq;
@@ -744,14 +808,23 @@ pub fn start(
             energy_n = 0;
         }
 
-        let deltas = {
+        let mut deltas = {
             let mut eng = engine_for_sink.lock().expect("engine mutex poisoned");
             eng.feed_pcm(chunk)
                 .map_err(|e| format!("语音识别中断：{e}"))?
         };
+        if !first_text_logged && deltas.iter().any(|segment| !segment.text.trim().is_empty()) {
+            first_text_logged = true;
+            tracing::info!(
+                request_to_first_decoded_text_ms = t0.elapsed().as_millis(),
+                non_silent_to_first_decoded_text_ms = ?non_silent_started_at.map(|started| started.elapsed().as_millis()),
+                "首次识别文本计时（非静音起点为电平估计，不含字幕广播与渲染）"
+            );
+        }
         if deltas.is_empty() {
             return Ok(());
         }
+        offset_segments(&mut deltas, timestamp_offset_ms);
         let changed = apply_asr_output(
             &store,
             deltas,
@@ -769,9 +842,8 @@ pub fn start(
                 tracing::info!(
                     start_ms = seg.start_ms,
                     end_ms = seg.end_ms,
-                    gap_ms = audio_ms - seg.end_ms as i128,
-                    "[定稿] {}",
-                    seg.text
+                    gap_ms = audio_ms - seg.end_ms.saturating_sub(timestamp_offset_ms) as i128,
+                    "段落已定稿"
                 );
             }
         }
@@ -799,6 +871,7 @@ pub fn start(
         device_sample_rate,
         translation,
         traditional_source,
+        timestamp_offset_ms,
         events: events.clone(),
     };
     let published = {
@@ -808,7 +881,7 @@ pub fn start(
             .expect("session lifecycle mutex poisoned");
         match lifecycle.publish(epoch, session) {
             Ok(()) => {
-                let _ = events.send(UiEvent::Status(TaskStatus::Capturing));
+                let _ = events.send(UiEvent::StateChanged);
                 Ok(())
             }
             Err(session) => {
@@ -821,9 +894,15 @@ pub fn start(
         }
     };
     if let Err((session, error)) = published {
+        let _ = events.send(UiEvent::StateChanged);
         schedule_teardown(app, session);
         return Err(error);
     }
+
+    tracing::info!(
+        request_to_ready_ms = t0.elapsed().as_millis(),
+        "开始请求到采集就绪"
+    );
 
     crate::telemetry::track(
         app,
@@ -838,6 +917,21 @@ pub fn start(
         })),
     );
 
+    Ok(())
+}
+
+pub(crate) fn finish_for_exit(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<SessionState>();
+    if state.is_running() {
+        stop(app)?;
+    }
+    let started = Instant::now();
+    while state.teardown_active.load(Ordering::SeqCst) {
+        if started.elapsed() > Duration::from_secs(60) {
+            return Err("末句与译文整理超过退出等待时限，已保留最近保存的定稿".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     Ok(())
 }
 
@@ -856,6 +950,7 @@ pub fn stop(app: &AppHandle) -> Result<(), String> {
         session
     };
     let Some(session) = session else {
+        notify_state_changed();
         tracing::info!("停止：没有运行中的会话，已取消尚未完成的启动");
         return Ok(());
     };
@@ -877,7 +972,7 @@ pub fn stop(app: &AppHandle) -> Result<(), String> {
             "segments": state.snapshot().len() as u64,
         })),
     );
-    let _ = session.events.send(UiEvent::Status(TaskStatus::Ready));
+    let _ = session.events.send(UiEvent::StateChanged);
     schedule_teardown(app, session);
     Ok(())
 }
@@ -969,9 +1064,15 @@ fn finish_teardown(app: &AppHandle, session: RunningSession) {
     if outcome.is_err() {
         tracing::error!("收尾线程异常退出");
     }
-    app.state::<SessionState>()
-        .teardown_active
-        .store(false, Ordering::SeqCst);
+    let state = app.state::<SessionState>();
+    {
+        let _lifecycle = state
+            .lifecycle
+            .lock()
+            .expect("session lifecycle mutex poisoned");
+        state.teardown_active.store(false, Ordering::SeqCst);
+    }
+    notify_state_changed();
 }
 
 fn teardown(app: &AppHandle, session: RunningSession) {
@@ -980,6 +1081,7 @@ fn teardown(app: &AppHandle, session: RunningSession) {
         engine,
         translation,
         traditional_source,
+        timestamp_offset_ms,
         events,
         ..
     } = session;
@@ -1000,7 +1102,8 @@ fn teardown(app: &AppHandle, session: RunningSession) {
         flushed
     };
     let changed = match tail {
-        Ok(tail) if !tail.is_empty() => {
+        Ok(mut tail) if !tail.is_empty() => {
+            offset_segments(&mut tail, timestamp_offset_ms);
             let state = app.state::<SessionState>();
             let applied = apply_asr_output(&state.store, tail, traditional_source, None, &events);
             match applied {
@@ -1041,9 +1144,166 @@ fn teardown(app: &AppHandle, session: RunningSession) {
     }
 }
 
+fn retry_config(app: &AppHandle, source_lang: Option<&str>) -> (TranslateConfig, MtModelTier) {
+    let prefs = crate::prefs::load(app);
+    let source_lang = source_lang.unwrap_or(&prefs.source_lang).to_owned();
+    (
+        TranslateConfig {
+            engine: if prefs.translate_engine == TranslateEngine::Off {
+                TranslateEngine::LocalNmt
+            } else {
+                prefs.translate_engine
+            },
+            target_lang: target_lang_for(&source_lang).into(),
+            source_lang,
+            zh_script: prefs.zh_script,
+            ..Default::default()
+        },
+        prefs.mt_model_tier,
+    )
+}
+
+pub fn retry_translations(app: &AppHandle, ids: &[String]) -> Result<(), String> {
+    if ids.is_empty() || ids.len() > 50 {
+        return Err("每次请选择 1 到 50 段重新翻译".into());
+    }
+    let state = app.state::<SessionState>();
+    let _guard = state.reserve_processing()?;
+    let pending = {
+        let mut store = state.store.lock().map_err(|_| "转写存储不可用")?;
+        for id in ids {
+            if !store.get(id).is_some_and(TranscriptSegment::is_persistable) {
+                return Err("只能重新翻译已定稿且仍存在的段落".into());
+            }
+        }
+        let mut pending = Vec::new();
+        for id in ids {
+            if pending.iter().any(|s: &TranscriptSegment| &s.id == id) {
+                continue;
+            }
+            pending.push(store.retry_translation(id).map_err(|e| e.to_string())?);
+        }
+        pending
+    };
+    emit_segments(app, pending.clone());
+    let source_lang = app
+        .try_state::<crate::workspace::WorkspaceState>()
+        .map(|s| s.source_lang());
+    let (config, tier) = retry_config(app, source_lang.as_deref());
+    let translator = create_translator(app, &config, tier).and_then(|translator| {
+        let mut translator = translator.ok_or("请启用本地翻译引擎")?;
+        translator.init(&config).map_err(|e| e.to_string())?;
+        Ok(translator)
+    });
+    let mut translator = match translator {
+        Ok(translator) => translator,
+        Err(error) => {
+            let changed = pending
+                .iter()
+                .filter_map(|s| {
+                    state
+                        .store
+                        .lock()
+                        .ok()?
+                        .set_translation_if_revision(&s.id, s.revision, Err(error.clone()))
+                        .ok()
+                        .flatten()
+                })
+                .collect();
+            emit_segments(app, changed);
+            return Err(error);
+        }
+    };
+    for segment in pending {
+        let result = if state.shutting_down.load(Ordering::SeqCst) {
+            Err("应用正在退出，翻译已暂停，可在下次启动后重试".into())
+        } else {
+            translator
+                .translate(&segment.text)
+                .map_err(|e| e.to_string())
+        };
+        let changed = state
+            .store
+            .lock()
+            .map_err(|_| "转写存储不可用")?
+            .set_translation_if_revision(&segment.id, segment.revision, result)
+            .map_err(|e| e.to_string())?;
+        if let Some(segment) = changed {
+            emit_segments(app, vec![segment]);
+        }
+    }
+    translator.shutdown();
+    Ok(())
+}
+
+pub fn retranslate_record(
+    app: &AppHandle,
+    id: &str,
+    ids: Option<&[String]>,
+) -> Result<crate::library::LibraryRecord, String> {
+    let state = app.state::<SessionState>();
+    let _guard = state.reserve_processing()?;
+    let repo = app.state::<crate::library::LibraryState>().repo();
+    let record = repo.get(id)?;
+    let selected = record
+        .segments
+        .iter()
+        .filter(|entry| ids.is_none_or(|ids| ids.contains(&entry.segment.id)))
+        .collect::<Vec<_>>();
+    if selected.is_empty() || selected.len() > 50 {
+        return Err("每次请选择 1 到 50 段重新翻译".into());
+    }
+    let (config, tier) = retry_config(app, record.source.source_lang.as_deref());
+    let mut translator = create_translator(app, &config, tier)?.ok_or("请启用本地翻译引擎")?;
+    translator.init(&config).map_err(|e| e.to_string())?;
+    let mut errors = Vec::new();
+    for entry in selected {
+        if state.shutting_down.load(Ordering::SeqCst) {
+            break;
+        }
+        let result = match translator.translate(&entry.segment.text) {
+            Ok(text) => repo.set_translation(
+                id,
+                &entry.segment.id,
+                entry.source_revision,
+                entry.segment.revision,
+                text,
+            ),
+            Err(error) => repo.set_translation_error(
+                id,
+                &entry.segment.id,
+                entry.source_revision,
+                entry.segment.revision,
+                error.to_string(),
+            ),
+        };
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    translator.shutdown();
+    let _ = app.emit(crate::library::EVENT_CHANGED, serde_json::json!({"id":id}));
+    if !errors.is_empty() {
+        return Err(errors.join("；"));
+    }
+    repo.get(id)
+}
+
 pub fn clear(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<SessionState>();
-    state.clear_with(|segments| broadcast_segments(app, segments))
+    state.clear_with(|segments| {
+        if let Some(workspace) = app.try_state::<crate::workspace::WorkspaceState>() {
+            workspace.reset();
+        }
+        broadcast_segments(app, segments)
+    })
+}
+
+fn offset_segments(segments: &mut [TranscriptSegment], offset: u64) {
+    for segment in segments {
+        segment.start_ms = segment.start_ms.saturating_add(offset);
+        segment.end_ms = segment.end_ms.saturating_add(offset);
+    }
 }
 
 fn apply_asr_output(
@@ -1115,12 +1375,10 @@ fn cancel_translation_jobs(
 ) -> Vec<TranscriptSegment> {
     jobs.into_iter()
         .filter_map(|job| {
-            if store.get(&job.segment_id)?.translation_state != TranslationState::Pending {
-                return None;
-            }
             store
-                .set_translation(&job.segment_id, Err(reason.to_owned()))
+                .set_translation_if_revision(&job.segment_id, job.revision, Err(reason.to_owned()))
                 .ok()
+                .flatten()
         })
         .collect()
 }
@@ -1143,6 +1401,7 @@ fn schedule_translation(
         let dropped = queue.push(Job {
             segment_id: segment.id.clone(),
             text: segment.text.clone(),
+            revision: segment.revision,
         });
         updates.push(segment);
         if let Some(dropped) = dropped {
@@ -1181,7 +1440,14 @@ fn coalesce(batch: Vec<TranscriptSegment>) -> Vec<TranscriptSegment> {
 
 fn emit_segments(app: &AppHandle, segments: Vec<TranscriptSegment>) {
     app.state::<SessionState>()
-        .broadcast_segments(segments, |segments| broadcast_segments(app, segments));
+        .broadcast_segments(segments, |segments| {
+            if segments.iter().any(TranscriptSegment::is_persistable) {
+                if let Some(workspace) = app.try_state::<crate::workspace::WorkspaceState>() {
+                    workspace.schedule(app.state::<SessionState>().snapshot());
+                }
+            }
+            broadcast_segments(app, segments)
+        });
 }
 
 fn broadcast_segments(app: &AppHandle, segments: Vec<TranscriptSegment>) {
@@ -1202,6 +1468,61 @@ mod tests {
     use super::*;
     use crate::transcript::SegmentState;
 
+    #[test]
+    fn session_info_serializes_legacy_status_and_camel_case_action_contract() {
+        let state = SessionState::default();
+        let value = serde_json::to_value(state.info()).unwrap();
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["phase"], "ready");
+        assert_eq!(value["actions"]["canStart"], true);
+        assert_eq!(value["actions"]["canStop"], false);
+        assert_eq!(value["actions"]["canClear"], true);
+        assert_eq!(value["actions"]["canExport"], true);
+        assert!(value["actions"]["reason"].is_null());
+        assert!(value.get("deviceSampleRate").is_some());
+        assert!(value.get("error").is_some());
+    }
+
+    #[test]
+    fn info_actions_preserve_export_during_preparation_but_reject_finalization() {
+        let state = SessionState::default();
+        let epoch = state.lifecycle.lock().unwrap().begin().unwrap();
+        let info = state.info();
+        assert_eq!(info.phase, SessionPhase::Preparing);
+        assert!(info.actions.can_export);
+        assert!(state.export_snapshot().is_ok());
+        assert!(!info.actions.can_clear);
+        assert!(state.clear_with(|_| panic!("准备期间不能清空")).is_err());
+        state.lifecycle.lock().unwrap().abort_start(epoch);
+        state.teardown_active.store(true, Ordering::SeqCst);
+        let info = state.info();
+        assert_eq!(info.status, TaskStatus::Ready);
+        assert_eq!(info.phase, SessionPhase::Finalizing);
+        assert!(!info.actions.can_export && !info.actions.can_start && !info.actions.can_clear);
+        assert!(state.export_snapshot().is_err());
+    }
+
+    #[test]
+    fn failed_preparation_notifies_even_when_legacy_status_stays_ready() {
+        let state = SessionState::default();
+        let (events, receiver) = std::sync::mpsc::channel();
+        let epoch = state.lifecycle.lock().unwrap().begin().unwrap();
+        let attempt = StartAttempt {
+            state: &state,
+            epoch,
+            events,
+        };
+        assert_eq!(state.info().phase, SessionPhase::Preparing);
+        drop(attempt);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            UiEvent::StateChanged
+        ));
+        assert_eq!(state.info().status, TaskStatus::Ready);
+        assert_eq!(state.info().phase, SessionPhase::Ready);
+        assert!(state.info().actions.can_start);
+    }
+
     fn seg(id: &str, text: &str, rev: u32) -> TranscriptSegment {
         TranscriptSegment {
             id: id.into(),
@@ -1210,6 +1531,7 @@ mod tests {
             text: text.into(),
             translation: None,
             translation_state: crate::transcript::TranslationState::Idle,
+            translation_error: None,
             state: SegmentState::Partial,
             revision: rev,
         }

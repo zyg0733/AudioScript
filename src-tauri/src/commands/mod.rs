@@ -116,6 +116,15 @@ pub fn init_executors() -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn enqueue_session(task: impl FnOnce() + Send + 'static) -> Result<(), String> {
+    CMD_EXECUTORS
+        .get()
+        .ok_or("会话执行线程尚未就绪")?
+        .session
+        .send(Box::new(task))
+        .map_err(|_| "会话执行线程已退出".into())
+}
+
 #[derive(Clone, Copy)]
 enum Lane {
     Quick,
@@ -165,6 +174,15 @@ pub async fn route_async(app: &AppHandle, name: &str, args: &Value) -> Result<Va
 
     let plan = match name {
         "session_start" => Some((Lane::Session, std::time::Duration::from_secs(60))),
+        "session_retry_translation" | "library_retranslate" => {
+            Some((Lane::Session, std::time::Duration::from_secs(600)))
+        }
+        name if name.starts_with("library_")
+            || name.starts_with("media_")
+            || name.starts_with("workspace_") =>
+        {
+            Some((Lane::Quick, std::time::Duration::from_secs(120)))
+        }
         "permission_probe_system_audio" => Some((Lane::Quick, std::time::Duration::from_secs(30))),
         "permission_request_mic" => Some((Lane::Quick, std::time::Duration::from_secs(40))),
         "models_list" => Some((Lane::Quick, std::time::Duration::from_secs(10))),
@@ -181,7 +199,33 @@ pub async fn route_async(app: &AppHandle, name: &str, args: &Value) -> Result<Va
 }
 
 pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdError> {
+    if name == "library_retranslate" {
+        let id = str_arg(args, "id")?;
+        let ids = args
+            .get("segmentIds")
+            .map(|v| serde_json::from_value::<Vec<String>>(v.clone()))
+            .transpose()
+            .map_err(|e| CmdError::BadArgs(e.to_string()))?;
+        return session::retranslate_record(app, id, ids.as_deref())
+            .map(|v| json!(v))
+            .map_err(CmdError::Failed);
+    }
+    if name.starts_with("library_") {
+        return crate::library::route(app, name, args).map_err(CmdError::Failed);
+    }
+    if name.starts_with("media_") {
+        return crate::media::route(app, name, args).map_err(CmdError::Failed);
+    }
+    if name.starts_with("workspace_") {
+        return crate::workspace::route(app, name, args).map_err(CmdError::Failed);
+    }
     match name {
+        "session_retry_translation" => {
+            let ids: Vec<String> = json_arg(args, "ids")?;
+            session::retry_translations(app, &ids)
+                .map(|_| Value::Null)
+                .map_err(CmdError::Failed)
+        }
         "app_info" => Ok(app_info()),
 
         "update_restart" => {
@@ -365,6 +409,7 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdErro
             "overlay": OverlayConfig::default(),
             "endpoint": EndpointConfig::default(),
             "endpointProfiles": {
+                "quickSubtitle": EndpointConfig::for_profile(EndpointProfile::QuickSubtitle),
                 "interpretation": EndpointConfig::for_profile(EndpointProfile::Interpretation),
                 "dictation": EndpointConfig::for_profile(EndpointProfile::Dictation),
             },

@@ -47,11 +47,32 @@ pub fn show_main(app: &AppHandle) {
 }
 
 pub fn quit_app(app: &AppHandle) {
-    tracing::info!("用户请求退出（唯一退出路径）");
-    if let Some(state) = app.try_state::<LifecycleState>() {
-        state.mark_quitting();
+    let state = app.state::<LifecycleState>();
+    if state.is_quitting() {
+        return;
     }
-    app.exit(0);
+    state.mark_quitting();
+    if let Some(media) = app.try_state::<crate::media::MediaState>() {
+        media.cancel_all();
+    }
+    app.state::<crate::session::SessionState>()
+        .request_shutdown();
+    let quit_app = app.clone();
+    if let Err(error) = crate::commands::enqueue_session(move || {
+        if let Err(error) = crate::session::finish_for_exit(&quit_app) {
+            tracing::warn!("退出收尾未完成：{error}");
+        }
+        if let Some(workspace) = quit_app.try_state::<crate::workspace::WorkspaceState>() {
+            workspace.flush();
+        }
+        quit_app.exit(0);
+    }) {
+        tracing::error!("无法安排退出收尾：{error}");
+        if let Some(workspace) = app.try_state::<crate::workspace::WorkspaceState>() {
+            workspace.flush();
+        }
+        app.exit(0);
+    }
 }
 
 pub fn on_window_event(window: &tauri::Window, event: &WindowEvent) {

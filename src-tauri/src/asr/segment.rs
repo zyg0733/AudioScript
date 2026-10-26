@@ -37,6 +37,7 @@ impl SegmentBuilder {
             text: text.to_owned(),
             translation: None,
             translation_state: TranslationState::Idle,
+            translation_error: None,
             state: if is_final {
                 SegmentState::Final
             } else {

@@ -106,8 +106,10 @@ describe('useTranscriptStream', () => {
     await act(async () => snapshot.resolve([history, old]))
     expect(current.segments).toEqual([history, latest, fresh])
 
+    const beforeStaleUpdate = current.segments
     await act(async () => broadcast([old]))
     expect(current.segments).toEqual([history, latest, fresh])
+    expect(current.segments).toBe(beforeStaleUpdate)
   })
 
   it('keeps a newer snapshot revision when an older delta was buffered', async () => {
@@ -221,5 +223,21 @@ describe('useTranscriptStream', () => {
     expect(ipc.snapshot).not.toHaveBeenCalled()
     await subscribe()
     expect(ipc.snapshot).toHaveBeenCalledOnce()
+  })
+  it('reconnects after a snapshot error without clearing visible text or retaining the old listener', async () => {
+    await render()
+    await subscribe()
+    const first = segment('retained')
+    await act(async () => {
+      broadcast([first])
+      snapshot.reject(new Error('暂时离线'))
+    })
+    ipc.on.mockResolvedValueOnce(vi.fn())
+    ipc.snapshot.mockResolvedValueOnce([first, segment('recovered')])
+    await act(async () => current.reconnect())
+    expect(unlisten).toHaveBeenCalledOnce()
+    expect(current.segments.map((item) => item.id)).toEqual(['retained', 'recovered'])
+    expect(current.error).toBeNull()
+    expect(current.reconnecting).toBe(false)
   })
 })

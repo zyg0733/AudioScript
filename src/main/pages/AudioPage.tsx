@@ -1,5 +1,7 @@
+import { useState } from 'react'
 import { useStore } from '@/main/store'
-import { AudioSourceKind, openPrivacySettings } from '@/shared/ipc'
+import { AudioSourceKind, formatCmdError, openPrivacySettings } from '@/shared/ipc'
+import { isMacOS, isWindows } from '@/shared/platform'
 import { TaskStatus } from '@/shared/types'
 import { Alert } from '@/ui/Alert'
 import { Button } from '@/ui/Button'
@@ -13,7 +15,7 @@ const SOURCE_OPTIONS = [
   {
     value: AudioSourceKind.Loopback,
     label: '系统声音',
-    description: '转写播放器输出的声音。需要「屏幕与系统音频录制」权限。',
+    description: '转写播放器输出的声音。',
   },
   { value: AudioSourceKind.Mic, label: '麦克风', description: '只转写麦克风输入，不碰播放器。' },
   {
@@ -47,10 +49,18 @@ export function AudioPage({ onOpenPermissions }: { onOpenPermissions: () => void
           <p className="font-mono text-[0.95em]">{deviceError}</p>
           <p className="mt-1">仍可使用「系统默认」设备，仅手动指定设备受影响。</p>
           <p className="mt-1">
-            麦克风授权未决时，macOS 会拒绝整份设备列表——先去「权限」页确认一下。
-            <Button size="sm" className="ml-1.5" onClick={onOpenPermissions}>
-              查看权限
-            </Button>
+            {isMacOS ? (
+              <>
+                麦克风授权未决时，macOS 可能无法列出设备，请先确认权限。
+                <Button size="sm" className="ml-1.5" onClick={onOpenPermissions}>
+                  查看权限
+                </Button>
+              </>
+            ) : isWindows ? (
+              '请检查 Windows 的音频设备设置与设备连接，再点击「刷新」。'
+            ) : (
+              '请检查系统音频服务与设备连接，再点击「刷新」。'
+            )}
           </p>
         </Alert>
       )}
@@ -66,7 +76,11 @@ export function AudioPage({ onOpenPermissions }: { onOpenPermissions: () => void
             <ChoiceCard
               key={o.value}
               title={o.label}
-              description={o.description}
+              description={
+                o.value === AudioSourceKind.Loopback && isMacOS
+                  ? `${o.description}需要「屏幕与系统音频录制」权限。`
+                  : o.description
+              }
               selected={audioSource === o.value}
               disabled={capturing || pending}
               onSelect={() => setAudioSource(o.value)}
@@ -111,7 +125,7 @@ export function AudioPage({ onOpenPermissions }: { onOpenPermissions: () => void
         />
       </SettingsGroup>
 
-      {capturing && <p className="text-[var(--color-ink-2)] text-[0.7rem]">采集期间修改设备仅下次会话生效。</p>}
+      {capturing && <p className="text-[var(--color-ink-2)] text-[0.7rem]">请先停止转写，再更换音源或输入设备。</p>}
     </Page>
   )
 }
@@ -125,6 +139,16 @@ function SilenceHelp({
 }) {
   const systemAudio = audioSource !== AudioSourceKind.Mic
   const mic = audioSource !== AudioSourceKind.Loopback
+  const [settingsError, setSettingsError] = useState<string | null>(null)
+
+  async function openSettings() {
+    setSettingsError(null)
+    try {
+      await openPrivacySettings(systemAudio ? 'systemAudio' : 'microphone')
+    } catch (e) {
+      setSettingsError(formatCmdError(e))
+    }
+  }
 
   return (
     <Alert tone="warn" title="收不到声音（电平 ≈ 0）">
@@ -132,29 +156,41 @@ function SilenceHelp({
         {systemAudio && (
           <>
             <li>确认播放器正在输出声音，且系统音量不为零。</li>
-            <li>
-              检查 macOS「屏幕与系统音频录制」权限。
-              <span className="font-medium">权限被拒时采集会正常启动，但始终返回数字静音</span>。
-            </li>
-            <li>所选设备为虚拟声卡（如 BlackHole）时，需先将音频路由至它。</li>
+            {isMacOS ? (
+              <>
+                <li>检查 macOS「屏幕与系统音频录制」权限；未授权时可能采集到静音。</li>
+                <li>所选设备为虚拟声卡（如 BlackHole）时，需先将音频路由至它。</li>
+              </>
+            ) : (
+              <li>确认播放器的输出设备与当前选择的系统声音采集设备一致；使用虚拟设备时，请检查音频路由。</li>
+            )}
           </>
         )}
-        {mic && <li>检查麦克风权限；虚拟回环设备需换为真实麦克风。</li>}
+        {mic && (
+          <li>
+            {isMacOS
+              ? '检查麦克风权限；虚拟回环设备需换为真实麦克风。'
+              : isWindows
+                ? '在 Windows 系统设置中确认麦克风访问已开启，并选择实际使用的输入设备。'
+                : '检查麦克风是否静音，确认所选输入设备有声音。'}
+          </li>
+        )}
       </ul>
-      <div className="mt-1.5 flex gap-1.5">
-        <Button size="sm" onClick={onOpenPermissions}>
-          去「权限」页检测
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={() => {
-            openPrivacySettings().catch(() => {})
-          }}
-        >
-          直接打开系统设置
-        </Button>
-      </div>
+      {isMacOS && (
+        <div className="mt-1.5 flex gap-1.5">
+          <Button size="sm" onClick={onOpenPermissions}>
+            去「权限」页检测
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => void openSettings()}>
+            直接打开系统设置
+          </Button>
+        </div>
+      )}
+      {settingsError && (
+        <p role="alert" className="mt-1">
+          无法打开系统设置：{settingsError}
+        </p>
+      )}
     </Alert>
   )
 }

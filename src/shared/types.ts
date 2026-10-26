@@ -51,6 +51,138 @@ export interface InputDevice {
 	isLoopback: boolean;
 }
 
+export interface LibraryChapter {
+	title: string;
+	startMs: number;
+	endMs: number;
+	segmentIds: string[];
+}
+
+export interface LibraryPoint {
+	text: string;
+	startMs: number;
+	endMs: number;
+	segmentIds: string[];
+}
+
+export interface LibraryAnalysis {
+	method: string;
+	notice: string;
+	chapters: LibraryChapter[];
+	points: LibraryPoint[];
+}
+
+export interface LibraryEvidence {
+	segmentId: string;
+	startMs: number;
+	endMs: number;
+	text: string;
+	translation?: string;
+}
+
+export interface LibraryAnswer {
+	method: string;
+	answer: string;
+	evidence: LibraryEvidence[];
+}
+
+export enum LibrarySourceKind {
+	Live = "live",
+	Media = "media",
+	Subtitle = "subtitle",
+}
+
+export interface LibrarySource {
+	kind: LibrarySourceKind;
+	label: string;
+	url?: string;
+	id?: string;
+	mediaPath?: string;
+	pcmPath?: string;
+	durationMs?: number;
+	derivedFromId?: string;
+	sourceLang?: string;
+}
+
+export enum TranslationState {
+	Idle = "idle",
+	Pending = "pending",
+	Done = "done",
+	Failed = "failed",
+}
+
+export enum SegmentState {
+	Partial = "partial",
+	Final = "final",
+	Edited = "edited",
+}
+
+export interface TranscriptSegment {
+	id: string;
+	startMs: number;
+	endMs: number;
+	text: string;
+	translation?: string;
+	translationState: TranslationState;
+	translationError?: string;
+	state: SegmentState;
+	revision: number;
+}
+
+export enum VersionOrigin {
+	Asr = "asr",
+	Live = "live",
+	User = "user",
+	Machine = "machine",
+	Restore = "restore",
+}
+
+export interface SegmentVersion {
+	revision: number;
+	sourceRevision: number;
+	text: string;
+	translation?: string;
+	translationState: TranslationState;
+	translationError?: string;
+	committedAt: number;
+	origin: VersionOrigin;
+}
+
+export interface LibrarySegment {
+	segment: TranscriptSegment;
+	sourceRevision: number;
+	bookmarked: boolean;
+	note: string;
+	bookmarkVersion?: number;
+	versions: SegmentVersion[];
+	sourceEdited?: boolean;
+	translationEdited?: boolean;
+	liveRevision?: number;
+}
+
+export interface LibraryRecord {
+	schemaVersion: number;
+	revision: number;
+	id: string;
+	title: string;
+	createdAt: number;
+	updatedAt: number;
+	source: LibrarySource;
+	segments: LibrarySegment[];
+}
+
+export interface LibrarySummary {
+	schemaVersion: number;
+	revision: number;
+	id: string;
+	title: string;
+	createdAt: number;
+	updatedAt: number;
+	source: LibrarySource;
+	segmentCount: number;
+	bookmarkCount: number;
+}
+
 export enum MicPermission {
 	Granted = "granted",
 	Denied = "denied",
@@ -223,6 +355,14 @@ export interface PrefsPatch {
 	analyticsEnabled?: boolean;
 }
 
+export interface SessionActions {
+	canStart: boolean;
+	canStop: boolean;
+	canClear: boolean;
+	canExport: boolean;
+	reason?: string;
+}
+
 export interface TranslateConfig {
 	engine: TranslateEngine;
 	sourceLang: string;
@@ -242,8 +382,19 @@ export enum TaskStatus {
 	Error = "error",
 }
 
+export enum SessionPhase {
+	Ready = "ready",
+	Preparing = "preparing",
+	Capturing = "capturing",
+	Finalizing = "finalizing",
+	Processing = "processing",
+	Error = "error",
+}
+
 export interface SessionInfo {
 	status: TaskStatus;
+	phase: SessionPhase;
+	actions: SessionActions;
 	device?: string;
 	deviceSampleRate?: number;
 	error?: string;
@@ -267,32 +418,39 @@ export interface SystemAudioProbe {
 	detail?: string;
 }
 
-export enum TranslationState {
-	Idle = "idle",
-	Pending = "pending",
-	Done = "done",
-	Failed = "failed",
-}
-
-export enum SegmentState {
-	Partial = "partial",
-	Final = "final",
-	Edited = "edited",
-}
-
-export interface TranscriptSegment {
+export interface Term {
 	id: string;
-	startMs: number;
-	endMs: number;
-	text: string;
-	translation?: string;
-	translationState: TranslationState;
-	state: SegmentState;
-	revision: number;
+	source: string;
+	target: string;
+	note: string;
+	createdAt: number;
+	updatedAt: number;
+}
+
+export interface TermSuggestion {
+	segmentId: string;
+	termId: string;
+	termUpdatedAt: number;
+	expectedRevision: number;
+	source: string;
+	target: string;
+	originalTranslation: string;
+	suggestedTranslation: string;
+	occurrences: number;
+	explanation: string;
+}
+
+export interface WorkspaceStatus {
+	enabled: boolean;
+	recordId?: string;
+	savedAt?: number;
+	saving: boolean;
+	error?: string;
 }
 
 export enum EndpointProfile {
 	Interpretation = "interpretation",
+	QuickSubtitle = "quickSubtitle",
 	Dictation = "dictation",
 }
 

@@ -46,6 +46,8 @@ pub struct TranscriptSegment {
     pub text: String,
     pub translation: Option<String>,
     pub translation_state: TranslationState,
+    #[serde(default)]
+    pub translation_error: Option<String>,
     pub state: SegmentState,
     pub revision: u32,
 }
@@ -124,6 +126,7 @@ impl TranscriptStore {
                 let seg = &mut self.segments[pos];
                 if seg.state.is_frozen() && seg.translation_state == TranslationState::Idle {
                     seg.translation_state = TranslationState::Pending;
+                    seg.translation_error = None;
                     seg.revision += 1;
                     changed.push(seg.clone());
                 }
@@ -147,15 +150,50 @@ impl TranscriptStore {
             Ok(text) => {
                 seg.translation = Some(text);
                 seg.translation_state = TranslationState::Done;
+                seg.translation_error = None;
             }
             Err(reason) => {
                 tracing::warn!(id, "翻译失败：{reason}");
                 seg.translation = None;
+                seg.translation_error = Some(reason);
                 seg.translation_state = TranslationState::Failed;
             }
         }
         seg.revision += 1;
         Ok(seg.clone())
+    }
+
+    pub fn retry_translation(&mut self, id: &str) -> Result<TranscriptSegment, StoreError> {
+        let pos = *self
+            .index
+            .get(id)
+            .ok_or_else(|| StoreError::UnknownSegment { id: id.into() })?;
+        let segment = &mut self.segments[pos];
+        if !segment.is_persistable() {
+            return Err(StoreError::NotFinalized {
+                id: id.into(),
+                current: segment.state,
+            });
+        }
+        segment.translation_state = TranslationState::Pending;
+        segment.translation_error = None;
+        segment.revision += 1;
+        Ok(segment.clone())
+    }
+
+    pub fn set_translation_if_revision(
+        &mut self,
+        id: &str,
+        revision: u32,
+        result: Result<String, String>,
+    ) -> Result<Option<TranscriptSegment>, StoreError> {
+        let current = self
+            .get(id)
+            .ok_or_else(|| StoreError::UnknownSegment { id: id.into() })?;
+        if current.revision != revision || current.translation_state != TranslationState::Pending {
+            return Ok(None);
+        }
+        self.set_translation(id, result).map(Some)
     }
 
     pub fn edit(&mut self, id: &str, text: String) -> Result<u32, StoreError> {
@@ -196,7 +234,11 @@ impl TranscriptStore {
     }
 }
 
-pub fn to_markdown(segments: &[TranscriptSegment], exported_at: &str, direction: Option<&str>) -> String {
+pub fn to_markdown(
+    segments: &[TranscriptSegment],
+    exported_at: &str,
+    direction: Option<&str>,
+) -> String {
     let mut out = String::from("# AudioScript 转写记录\n\n");
     out.push_str(&format!("- 导出时间：{exported_at}\n"));
     if let Some(d) = direction {
@@ -207,8 +249,17 @@ pub fn to_markdown(segments: &[TranscriptSegment], exported_at: &str, direction:
     out.push_str(&format!("- 段落数：{}\n\n---\n\n", settled.len()));
 
     for s in settled {
-        out.push_str(&format!("**[{}]** {}\n\n", clock(s.start_ms), s.text.trim()));
-        if let Some(t) = s.translation.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        out.push_str(&format!(
+            "**[{}]** {}\n\n",
+            clock(s.start_ms),
+            s.text.trim()
+        ));
+        if let Some(t) = s
+            .translation
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
             out.push_str(&format!("> {t}\n\n"));
         }
     }
@@ -237,6 +288,7 @@ mod tests {
             text: text.into(),
             translation: None,
             translation_state: TranslationState::Idle,
+            translation_error: None,
             state,
             revision,
         }
@@ -273,6 +325,29 @@ mod tests {
         assert_eq!(updated.translation.as_deref(), Some("你好世界"));
         assert_eq!(updated.translation_state, TranslationState::Done);
         assert!(updated.has_translation());
+    }
+
+    #[test]
+    fn late_translation_cannot_overwrite_a_new_retry_or_hide_its_failure_reason() {
+        let mut store = TranscriptStore::new();
+        store
+            .apply(vec![seg("a", "hello", SegmentState::Final, 1)])
+            .unwrap();
+        let first = store.retry_translation("a").unwrap();
+        let next = store.retry_translation("a").unwrap();
+        assert!(store
+            .set_translation_if_revision("a", first.revision, Ok("过期译文".into()))
+            .unwrap()
+            .is_none());
+        store
+            .set_translation_if_revision("a", next.revision, Err("模型加载失败".into()))
+            .unwrap();
+        let final_segment = store.get("a").unwrap();
+        assert_eq!(
+            final_segment.translation_error.as_deref(),
+            Some("模型加载失败")
+        );
+        assert_eq!(final_segment.translation_state, TranslationState::Failed);
     }
 
     #[test]

@@ -41,7 +41,7 @@ import {
   ZhScript,
 } from '@/shared/ipc'
 import { withTimeout } from '@/shared/timeout'
-import { TaskStatus } from '@/shared/types'
+import { type SessionInfo, SessionPhase, TaskStatus } from '@/shared/types'
 
 type EndpointConfig = Preferences['endpoint']
 
@@ -60,6 +60,8 @@ interface Store {
   endpoint: EndpointConfig
 
   status: TaskStatus
+  sessionInfo: SessionInfo | null
+  refreshSession: () => Promise<void>
   activeDevice: string | null
   audio: AudioStatus | null
 
@@ -141,6 +143,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   })
 
   const [status, setStatus] = useState<TaskStatus>(TaskStatus.Ready)
+  const [sessionInfo, setSessionInfo] = useState<SessionInfo | null>(null)
   const [activeDevice, setActiveDevice] = useState<string | null>(null)
   const [audio, setAudio] = useState<AudioStatus | null>(null)
   const sessionVersion = useRef(0)
@@ -198,6 +201,27 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setOverlayCfg(config)
   }, [])
 
+  const applySession = useCallback((current: SessionInfo) => {
+    setSessionInfo(current)
+    setStatus(current.status)
+    setActiveDevice(current.device ?? null)
+    if (current.status !== TaskStatus.Capturing) setAudio(null)
+    if (current.error) setError(current.error)
+  }, [])
+
+  const refreshSession = useCallback(async () => {
+    const version = ++sessionVersion.current
+    try {
+      const current = await sessionStatus()
+      if (!lifetime.current.active || version !== sessionVersion.current) return
+      applySession(current)
+    } catch (e) {
+      if (lifetime.current.active && version === sessionVersion.current) {
+        setError(`读取会话状态失败：${formatCmdError(e)}`)
+      }
+    }
+  }, [applySession])
+
   useEffect(() => {
     appInfo()
       .then(setInfo)
@@ -219,23 +243,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const reportError = (e: unknown) => {
       if (!disposed) setError(formatCmdError(e))
     }
-    const refreshSession = async () => {
-      const version = ++sessionVersion.current
-      try {
-        const current = await sessionStatus()
-        if (disposed || version !== sessionVersion.current) return
-        setStatus(current.status)
-        setActiveDevice(current.device ?? null)
-        if (current.status !== TaskStatus.Capturing) setAudio(null)
-        if (current.error) setError(current.error)
-      } catch (e) {
-        if (version === sessionVersion.current) reportError(e)
-      }
-    }
-
     on<TaskStatus>(EVENT.taskState, (s) => {
       if (disposed) return
       setStatus(s)
+      setSessionInfo(null)
       if (s !== TaskStatus.Capturing) {
         setAudio(null)
         setActiveDevice(null)
@@ -252,9 +263,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (disposed) return
       sessionVersion.current++
       setStatus(TaskStatus.Error)
+      setSessionInfo(null)
       setActiveDevice(null)
       setAudio(null)
       setError(message)
+      void refreshSession()
     })
       .then(keep)
       .catch(reportError)
@@ -276,7 +289,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       sessionVersion.current++
       for (const fn of unlisten) fn()
     }
-  }, [applyOverlay])
+  }, [applyOverlay, refreshSession])
 
   useEffect(() => {
     let disposed = false
@@ -428,6 +441,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   )
 
   const completeOnboarding = useCallback(async () => {
+    setError(null)
     try {
       const saved = await savePrefs({ onboardingDone: true })
       if (saved) {
@@ -475,6 +489,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const toggleSession = useCallback(async () => {
     if (pendingRef.current) return
+    if (!sessionInfo) {
+      await refreshSession()
+      return
+    }
+    const stopping = status === TaskStatus.Capturing
+    if (stopping ? !sessionInfo.actions.canStop : !sessionInfo.actions.canStart) {
+      setError(sessionInfo.actions.reason ?? '会话状态正在变化，请稍后再试')
+      return
+    }
     if (status !== TaskStatus.Capturing && updateExclusiveRef.current) {
       setError('正在下载、安装更新或重启，请等待完成后再开始转写')
       return
@@ -506,14 +529,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         )
         void refreshPermission()
       }
-      const version = ++sessionVersion.current
-      const current = await sessionStatus()
-      if (version === sessionVersion.current) {
-        setStatus(current.status)
-        setActiveDevice(current.device ?? null)
-        if (current.status !== TaskStatus.Capturing) setAudio(null)
-        if (current.error) setError(current.error)
-      }
+      await refreshSession()
     } catch (e) {
       const denied = permissionOf(e)
       if (denied) {
@@ -522,20 +538,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } else {
         setError(formatCmdError(e))
       }
-      const version = ++sessionVersion.current
-      sessionStatus()
-        .then((i) => {
-          if (version !== sessionVersion.current) return
-          setStatus(i.status)
-          setActiveDevice(i.device ?? null)
-          if (i.error) setError(i.error)
-        })
-        .catch(() => {})
+      await refreshSession()
     } finally {
       pendingRef.current = false
       setPending(false)
     }
-  }, [status, refreshPermission])
+  }, [status, sessionInfo, refreshPermission, refreshSession])
 
   const clearAll = useCallback(async () => {
     await sessionClear()
@@ -681,7 +689,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setUpdatePhase('error')
       return
     }
-    if (pendingRef.current || status === TaskStatus.Capturing) {
+    if (!sessionInfo) {
+      setUpdateError('会话状态尚未同步，请先重新读取会话状态')
+      setUpdatePhase('error')
+      return
+    }
+    if (
+      pendingRef.current ||
+      status === TaskStatus.Capturing ||
+      sessionInfo?.phase === SessionPhase.Preparing ||
+      sessionInfo?.phase === SessionPhase.Finalizing
+    ) {
       setUpdateError('请先停止转写并等待会话收尾完成，再安装更新')
       setUpdatePhase('error')
       return
@@ -705,7 +723,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       updateBusyRef.current = false
       updateExclusiveRef.current = false
     }
-  }, [info, updateInfo, status, flushSettings])
+  }, [info, updateInfo, status, sessionInfo, flushSettings])
 
   const restartApp = useCallback(async () => {
     if (updateBusyRef.current) return
@@ -713,7 +731,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setError('请先完成更新安装，再重启应用')
       return
     }
-    if (pendingRef.current || status === TaskStatus.Capturing) {
+    if (!sessionInfo) {
+      setError('会话状态尚未同步，请先重新读取会话状态')
+      return
+    }
+    if (
+      pendingRef.current ||
+      status === TaskStatus.Capturing ||
+      sessionInfo?.phase === SessionPhase.Preparing ||
+      sessionInfo?.phase === SessionPhase.Finalizing
+    ) {
       setError('请先停止转写并等待会话收尾完成，再重启应用')
       return
     }
@@ -733,7 +760,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       updateExclusiveRef.current = false
       setUpdateRestarting(false)
     }
-  }, [updatePhase, installedVersion, status, flushSettings])
+  }, [updatePhase, installedVersion, status, sessionInfo, flushSettings])
 
   const autoCheckedRef = useRef(false)
   useEffect(() => {
@@ -765,6 +792,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       theme,
       endpoint,
       status,
+      sessionInfo,
+      refreshSession,
       activeDevice,
       audio,
       devices,
@@ -818,6 +847,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       theme,
       endpoint,
       status,
+      sessionInfo,
+      refreshSession,
       activeDevice,
       audio,
       devices,

@@ -7,9 +7,14 @@ export function useTranscriptStream(): {
   segments: TranscriptSegment[]
   clear: () => void
   error: string | null
+  reconnect: () => void
+  reconnecting: boolean
 } {
   const [segments, setSegments] = useState<TranscriptSegment[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [connection, setConnection] = useState(0)
+  const [reconnecting, setReconnecting] = useState(false)
+  const reconnect = useCallback(() => setConnection((version) => version + 1), [])
   const clearVersion = useRef(0)
 
   const clear = useCallback(() => {
@@ -17,6 +22,7 @@ export function useTranscriptStream(): {
     setSegments([])
   }, [])
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: connection 是用户主动重建订阅的代次。
   useEffect(() => {
     let disposed = false
     let snapshotPending = true
@@ -24,6 +30,7 @@ export function useTranscriptStream(): {
     let bufferVersion = clearVersion.current
     let unlisten: (() => void) | null = null
     setError(null)
+    setReconnecting(true)
 
     async function connect() {
       try {
@@ -47,7 +54,10 @@ export function useTranscriptStream(): {
         }
         unlisten = stop
       } catch (e) {
-        if (!disposed) setError(`字幕订阅失败：${formatCmdError(e)}`)
+        if (!disposed) {
+          setError(`字幕订阅失败：${formatCmdError(e)}`)
+          setReconnecting(false)
+        }
         return
       }
 
@@ -63,6 +73,7 @@ export function useTranscriptStream(): {
       } finally {
         snapshotPending = false
         buffered = []
+        if (!disposed) setReconnecting(false)
       }
     }
 
@@ -72,7 +83,7 @@ export function useTranscriptStream(): {
       disposed = true
       unlisten?.()
     }
-  }, [clear])
+  }, [clear, connection])
 
-  return { segments, clear, error }
+  return { segments, clear, error, reconnect, reconnecting }
 }

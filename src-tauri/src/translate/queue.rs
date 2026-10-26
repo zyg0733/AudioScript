@@ -5,6 +5,7 @@ use std::sync::{Condvar, Mutex};
 pub struct Job {
     pub segment_id: String,
     pub text: String,
+    pub revision: u32,
 }
 
 struct Inner {
@@ -90,6 +91,7 @@ mod tests {
         Job {
             segment_id: id.into(),
             text: format!("text-{id}"),
+            revision: 0,
         }
     }
 

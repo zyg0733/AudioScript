@@ -52,6 +52,7 @@ pnpm tauri build      # 打包
 
 - 当前 fork 的问题反馈与发布：[zyg0733/AudioScript](https://github.com/zyg0733/AudioScript)。
 - fork 构建、签名与上游同步：[维护说明](docs/FORK_MAINTENANCE.md)。
+- 后续开发：[阶段迭代计划](docs/IMPLEMENTATION_PLAN.md)。
 - 原项目作者 Nico：X [@niyongsheng](https://x.com/niyongsheng)，E‑mail niyongsheng@Outlook.com。
 - [赞助原作者 Nico](https://ifdian.net/a/nico2026)：此入口属于原作者。
 

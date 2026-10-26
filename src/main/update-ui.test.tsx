@@ -1,7 +1,7 @@
 import { act, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { TaskStatus } from '@/shared/types'
+import { SessionPhase, TaskStatus } from '@/shared/types'
 import { App } from './App'
 import { AboutPage } from './pages/AboutPage'
 
@@ -51,6 +51,11 @@ describe('Update controls and session exclusion', () => {
       prefsReady: true,
       onboardingDone: true,
       status: TaskStatus.Ready,
+      sessionInfo: {
+        status: TaskStatus.Ready,
+        phase: SessionPhase.Ready,
+        actions: { canStart: true, canStop: false, canClear: true, canExport: true, reason: null },
+      },
       pending: false,
       activeDevice: null,
       error: null,
@@ -67,6 +72,8 @@ describe('Update controls and session exclusion', () => {
       installUpdate: mocks.installUpdate,
       restartApp: mocks.restartApp,
       checkUpdate: vi.fn(),
+      refreshSession: vi.fn(),
+      setError: vi.fn(),
     }
     container = document.createElement('div')
     document.body.append(container)
@@ -97,11 +104,48 @@ describe('Update controls and session exclusion', () => {
 
   it('keeps stopping available if a session is active during an update', async () => {
     mocks.store.status = TaskStatus.Capturing
+    mocks.store.sessionInfo = {
+      status: TaskStatus.Capturing,
+      phase: SessionPhase.Capturing,
+      actions: { canStart: false, canStop: true, canClear: false, canExport: true, reason: null },
+    }
     mocks.store.updatePhase = 'downloading'
     await render()
     expect(button('停止转写').disabled).toBe(false)
     await act(async () => button('停止转写').click())
     expect(mocks.toggleSession).toHaveBeenCalledOnce()
+  })
+
+  it('retains a recovery action when an unknown-session error is dismissed', async () => {
+    mocks.store.sessionInfo = null
+    mocks.store.error = '读取会话状态失败'
+    await render()
+    await act(async () => button('关闭').click())
+    mocks.store.error = null
+    await render()
+    expect(button('开始转写').disabled).toBe(true)
+    await act(async () => button('重新读取会话状态').click())
+    expect(mocks.store.refreshSession).toHaveBeenCalledOnce()
+    await render(true)
+    expect(button('下载并安装').disabled).toBe(true)
+  })
+
+  it.each([
+    [SessionPhase.Preparing, '正在准备模型'],
+    [SessionPhase.Finalizing, '正在整理末句与译文'],
+  ])('shows backend %s without depending on a frontend pending request', async (phase, label) => {
+    mocks.store.sessionInfo = {
+      status: TaskStatus.Ready,
+      phase,
+      actions: { canStart: false, canStop: false, canClear: false, canExport: false, reason: label },
+    }
+    await render()
+    expect(button('开始转写').disabled).toBe(true)
+    expect(container.textContent).toContain(label)
+    await act(async () => button('开始转写').click())
+    expect(mocks.toggleSession).not.toHaveBeenCalled()
+    await render(true)
+    expect(button('下载并安装').disabled).toBe(true)
   })
 
   it('disables installation while a session command is pending even with ready status', async () => {

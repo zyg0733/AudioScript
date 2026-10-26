@@ -7,7 +7,7 @@ use tauri::{
 };
 
 use crate::config::OverlayMode;
-use crate::session::{SessionState, TaskStatus};
+use crate::session::{SessionInfo, SessionPhase, SessionState, TaskStatus};
 use crate::{lifecycle, overlay};
 
 pub const TRAY_ID: &str = "audioscript-tray";
@@ -31,9 +31,11 @@ pub struct TrayState {
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
     let show_main = MenuItemBuilder::with_id(id::SHOW_MAIN, "显示主窗口").build(app)?;
 
-    let capturing = app.state::<SessionState>().status() == TaskStatus::Capturing;
-    let session_item =
-        MenuItemBuilder::with_id(id::TOGGLE_SESSION, session_text(capturing)).build(app)?;
+    let info = app.state::<SessionState>().info();
+    let (text, enabled) = session_presentation(&info);
+    let session_item = MenuItemBuilder::with_id(id::TOGGLE_SESSION, text)
+        .enabled(enabled)
+        .build(app)?;
 
     let visibility_item = MenuItemBuilder::with_id(
         id::TOGGLE_OVERLAY,
@@ -81,11 +83,13 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn session_text(capturing: bool) -> &'static str {
-    if capturing {
-        "停止转写"
-    } else {
-        "开始转写"
+fn session_presentation(info: &SessionInfo) -> (&'static str, bool) {
+    match info.phase {
+        SessionPhase::Preparing => ("正在准备转写…", false),
+        SessionPhase::Finalizing => ("正在整理末句…", false),
+        SessionPhase::Processing => ("正在处理资料…", false),
+        _ if info.actions.can_stop => ("停止转写", true),
+        _ => ("开始转写", info.actions.can_start),
     }
 }
 
@@ -106,15 +110,17 @@ pub fn sync_mode(app: &AppHandle, mode: OverlayMode) {
     }
 }
 
-pub fn sync_task_state(app: &AppHandle, status: TaskStatus) {
+pub fn sync_task_state(app: &AppHandle, _status: TaskStatus) {
     let Some(state) = app.try_state::<TrayState>() else {
         return;
     };
-    if let Err(e) = state
-        .session_item
-        .set_text(session_text(status == TaskStatus::Capturing))
-    {
+    let info = app.state::<SessionState>().info();
+    let (text, enabled) = session_presentation(&info);
+    if let Err(e) = state.session_item.set_text(text) {
         tracing::error!("同步托盘转写项失败：{e}");
+    }
+    if let Err(e) = state.session_item.set_enabled(enabled) {
+        tracing::error!("同步托盘转写项可用性失败：{e}");
     }
 }
 
@@ -173,13 +179,17 @@ fn on_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     match event.id().as_ref() {
         id::SHOW_MAIN => lifecycle::show_main(app),
         id::TOGGLE_SESSION => {
-            if app.state::<SessionState>().status() == TaskStatus::Capturing {
+            let info = app.state::<SessionState>().info();
+            if info.actions.can_stop {
                 match crate::session::stop(app) {
                     Ok(()) => tracing::info!("托盘：已请求停止转写"),
                     Err(e) => tracing::error!("托盘停止转写失败：{e}"),
                 }
-            } else {
+            } else if info.actions.can_start {
                 start_session(app);
+            } else {
+                tracing::debug!(reason = ?info.actions.reason, "托盘转写操作暂不可用");
+                sync_task_state(app, info.status);
             }
         }
         id::TOGGLE_OVERLAY => {
@@ -215,5 +225,40 @@ fn on_tray_event(tray: &tauri::tray::TrayIcon, event: TrayIconEvent) {
     } = event
     {
         lifecycle::show_main(tray.app_handle());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::SessionActions;
+
+    #[test]
+    fn tray_uses_phase_and_action_permissions_instead_of_legacy_ready_status() {
+        let mut info = SessionInfo {
+            status: TaskStatus::Ready,
+            phase: SessionPhase::Preparing,
+            actions: SessionActions {
+                can_start: false,
+                can_stop: false,
+                can_clear: false,
+                can_export: true,
+                reason: None,
+            },
+            device: None,
+            device_sample_rate: None,
+            error: None,
+        };
+        assert_eq!(session_presentation(&info), ("正在准备转写…", false));
+        info.phase = SessionPhase::Finalizing;
+        assert_eq!(session_presentation(&info), ("正在整理末句…", false));
+        info.phase = SessionPhase::Ready;
+        assert_eq!(session_presentation(&info), ("开始转写", false));
+        info.actions.can_start = true;
+        assert_eq!(session_presentation(&info), ("开始转写", true));
+        info.phase = SessionPhase::Capturing;
+        info.actions.can_start = false;
+        info.actions.can_stop = true;
+        assert_eq!(session_presentation(&info), ("停止转写", true));
     }
 }

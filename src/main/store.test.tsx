@@ -3,7 +3,16 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AppInfo, OverlayConfig, Preferences } from '@/shared/ipc'
 import { EVENT } from '@/shared/ipc'
-import { AudioSourceKind, OverlayMode, TaskStatus, Theme, TranslateEngine, ZhScript } from '@/shared/types'
+import {
+  AudioSourceKind,
+  OverlayMode,
+  type SessionInfo,
+  SessionPhase,
+  TaskStatus,
+  Theme,
+  TranslateEngine,
+  ZhScript,
+} from '@/shared/types'
 import { StoreProvider, useStore } from './store'
 
 const ipc = vi.hoisted(() => ({
@@ -68,6 +77,38 @@ function deferred<T>() {
     reject = no
   })
   return { promise, resolve, reject }
+}
+
+function sessionInfoFor(
+  patch: Omit<Partial<SessionInfo>, 'device' | 'deviceSampleRate' | 'error'> & {
+    device?: string | null
+    deviceSampleRate?: number | null
+    error?: string | null
+  } = {},
+): SessionInfo {
+  const status = patch.status ?? TaskStatus.Ready
+  const phase =
+    patch.phase ??
+    (status === TaskStatus.Capturing
+      ? SessionPhase.Capturing
+      : status === TaskStatus.Error
+        ? SessionPhase.Error
+        : SessionPhase.Ready)
+  return {
+    status,
+    phase,
+    actions: {
+      canStart: phase === SessionPhase.Ready || phase === SessionPhase.Error,
+      canStop: phase === SessionPhase.Capturing,
+      canClear: phase === SessionPhase.Ready || phase === SessionPhase.Error,
+      canExport: phase !== SessionPhase.Finalizing,
+      reason: undefined,
+    },
+    ...patch,
+    device: patch.device ?? undefined,
+    deviceSampleRate: patch.deviceSampleRate ?? undefined,
+    error: patch.error ?? undefined,
+  }
 }
 
 describe('StoreProvider session and fork capabilities', () => {
@@ -166,7 +207,7 @@ describe('StoreProvider session and fork capabilities', () => {
     })
     ipc.overlayConfigGet.mockResolvedValue(savedPrefs.overlay)
     ipc.overlayConfigSet.mockImplementation(async (config) => config)
-    ipc.sessionStatus.mockResolvedValue({ status: TaskStatus.Ready, device: null, error: null })
+    ipc.sessionStatus.mockResolvedValue(sessionInfoFor({ status: TaskStatus.Ready, device: null, error: null }))
     ipc.sessionStop.mockResolvedValue(null)
     ipc.updateCheck.mockResolvedValue({
       currentVersion: '0.2.12',
@@ -195,37 +236,86 @@ describe('StoreProvider session and fork capabilities', () => {
   })
 
   it('restores a running session and its active device when the window mounts', async () => {
-    ipc.sessionStatus.mockResolvedValue({ status: TaskStatus.Capturing, device: '系统声音', error: null })
+    ipc.sessionStatus.mockResolvedValue(
+      sessionInfoFor({ status: TaskStatus.Capturing, device: '系统声音', error: null }),
+    )
     await render()
     expect(store.status).toBe(TaskStatus.Capturing)
     expect(store.activeDevice).toBe('系统声音')
   })
 
+  it('refreshes backend phases even when the public task status stays ready', async () => {
+    ipc.sessionStatus.mockResolvedValue(sessionInfoFor({ phase: SessionPhase.Preparing }))
+    await render()
+    expect(store.sessionInfo?.phase).toBe(SessionPhase.Preparing)
+    await act(async () => store.toggleSession())
+    expect(ipc.sessionStart).not.toHaveBeenCalled()
+
+    ipc.sessionStatus.mockResolvedValue(sessionInfoFor({ phase: SessionPhase.Finalizing }))
+    await act(async () => listeners.get(EVENT.taskState)?.(TaskStatus.Ready))
+    expect(store.sessionInfo?.phase).toBe(SessionPhase.Finalizing)
+    expect(store.sessionInfo?.actions.canExport).toBe(false)
+
+    ipc.sessionStatus.mockResolvedValue(sessionInfoFor())
+    await act(async () => listeners.get(EVENT.taskState)?.(TaskStatus.Ready))
+    expect(store.sessionInfo?.actions.canStart).toBe(true)
+    await act(async () => store.toggleSession())
+    expect(ipc.sessionStart).toHaveBeenCalledOnce()
+  })
+
+  it('can retry a failed session snapshot without submitting a start request', async () => {
+    ipc.sessionStatus.mockRejectedValueOnce(new Error('暂时不可用'))
+    await render()
+    expect(store.sessionInfo).toBeNull()
+    expect(store.error).toContain('读取会话状态失败')
+    await act(async () => store.refreshSession())
+    expect(store.sessionInfo?.phase).toBe(SessionPhase.Ready)
+    expect(ipc.sessionStart).not.toHaveBeenCalled()
+  })
+
+  it.each([SessionPhase.Preparing, SessionPhase.Finalizing])(
+    'rejects installing during backend %s even without a pending frontend request',
+    async (phase) => {
+      await availableUpdate()
+      ipc.sessionStatus.mockResolvedValue(sessionInfoFor({ phase }))
+      await act(async () => listeners.get(EVENT.taskState)?.(TaskStatus.Ready))
+      expect(store.pending).toBe(false)
+      await act(async () => store.installUpdate())
+      expect(ipc.updateInstall).not.toHaveBeenCalled()
+      expect(store.updateError).toContain('收尾')
+    },
+  )
+
   it('refreshes the session snapshot after a tray start and clears it after stop', async () => {
     await render()
-    ipc.sessionStatus.mockResolvedValue({ status: TaskStatus.Capturing, device: '麦克风', error: null })
+    ipc.sessionStatus.mockResolvedValue(sessionInfoFor({ status: TaskStatus.Capturing, device: '麦克风', error: null }))
     await act(async () => listeners.get(EVENT.taskState)?.(TaskStatus.Capturing))
     expect(store.activeDevice).toBe('麦克风')
 
-    ipc.sessionStatus.mockResolvedValue({ status: TaskStatus.Ready, device: null, error: null })
+    ipc.sessionStatus.mockResolvedValue(sessionInfoFor({ status: TaskStatus.Ready, device: null, error: null }))
     await act(async () => listeners.get(EVENT.taskState)?.(TaskStatus.Ready))
     expect(store.status).toBe(TaskStatus.Ready)
     expect(store.activeDevice).toBeNull()
   })
 
   it('shows runtime faults and rejects an older pending session snapshot', async () => {
-    const pending = deferred<{ status: TaskStatus; device: string; error: null }>()
-    ipc.sessionStatus.mockReturnValue(pending.promise)
+    const pending = deferred<SessionInfo>()
+    ipc.sessionStatus.mockReturnValueOnce(pending.promise)
     await render()
+    ipc.sessionStatus.mockResolvedValue(
+      sessionInfoFor({ status: TaskStatus.Error, error: '设备已断开，请重新选择音源' }),
+    )
     await act(async () => listeners.get(EVENT.sessionError)?.('设备已断开，请重新选择音源'))
-    await act(async () => pending.resolve({ status: TaskStatus.Capturing, device: '旧设备', error: null }))
+    await act(async () =>
+      pending.resolve(sessionInfoFor({ status: TaskStatus.Capturing, device: '旧设备', error: null })),
+    )
     expect(store.status).toBe(TaskStatus.Error)
     expect(store.activeDevice).toBeNull()
     expect(store.error).toBe('设备已断开，请重新选择音源')
   })
 
   it('restores the backend fault reason when reopening the window', async () => {
-    ipc.sessionStatus.mockResolvedValue({ status: TaskStatus.Error, device: null, error: '推理失败' })
+    ipc.sessionStatus.mockResolvedValue(sessionInfoFor({ status: TaskStatus.Error, device: null, error: '推理失败' }))
     await render()
     expect(store.status).toBe(TaskStatus.Error)
     expect(store.error).toBe('推理失败')
@@ -239,7 +329,9 @@ describe('StoreProvider session and fork capabilities', () => {
     await act(async () => {
       toggle = store.toggleSession()
     })
-    ipc.sessionStatus.mockResolvedValue({ status: TaskStatus.Error, device: null, error: '采集启动后断开' })
+    ipc.sessionStatus.mockResolvedValue(
+      sessionInfoFor({ status: TaskStatus.Error, device: null, error: '采集启动后断开' }),
+    )
     await act(async () => {
       listeners.get(EVENT.sessionError)?.('采集启动后断开')
       start.resolve(TaskStatus.Capturing)
@@ -441,12 +533,12 @@ describe('StoreProvider session and fork capabilities', () => {
 
   it('rejects installing during capture or a pending session start', async () => {
     await availableUpdate()
-    ipc.sessionStatus.mockResolvedValue({ status: TaskStatus.Capturing, device: '麦克风', error: null })
+    ipc.sessionStatus.mockResolvedValue(sessionInfoFor({ status: TaskStatus.Capturing, device: '麦克风', error: null }))
     await act(async () => listeners.get(EVENT.taskState)?.(TaskStatus.Capturing))
     await act(async () => store.installUpdate())
     expect(ipc.updateInstall).not.toHaveBeenCalled()
 
-    ipc.sessionStatus.mockResolvedValue({ status: TaskStatus.Ready, device: null, error: null })
+    ipc.sessionStatus.mockResolvedValue(sessionInfoFor({ status: TaskStatus.Ready, device: null, error: null }))
     await act(async () => listeners.get(EVENT.taskState)?.(TaskStatus.Ready))
     const starting = deferred<TaskStatus>()
     ipc.sessionStart.mockReturnValueOnce(starting.promise)

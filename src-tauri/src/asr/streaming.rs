@@ -99,30 +99,30 @@ struct UtteranceState {
     index: i64,
     start_ms: u64,
     text: Option<String>,
-    updated: bool,
+    last_partial_text: Option<String>,
 }
 
 impl UtteranceState {
     fn observe(&mut self, text: &str) {
         if !text.trim().is_empty() {
             self.text = Some(crate::asr::latin_case::restore_sentence_case(text));
-            self.updated = true;
         }
     }
 
     fn partial(&mut self, end_ms: u64) -> Option<TranscriptSegment> {
-        if !std::mem::take(&mut self.updated) {
+        let text = self.text.as_deref()?;
+        if self.last_partial_text.as_deref() == Some(text) {
             return None;
         }
-        let text = self.text.as_deref()?;
-        Some(
-            self.builder
-                .build(self.index, text, self.start_ms, end_ms, false),
-        )
+        let segment = self
+            .builder
+            .build(self.index, text, self.start_ms, end_ms, false);
+        self.last_partial_text = Some(text.to_owned());
+        Some(segment)
     }
 
     fn finish(&mut self, end_ms: u64) -> Option<TranscriptSegment> {
-        self.updated = false;
+        self.last_partial_text = None;
         let text = self.text.take()?;
         let segment = self
             .builder
@@ -296,6 +296,86 @@ impl AsrEngine for StreamingAdapter {
 mod tests {
     use super::*;
     use crate::transcript::{SegmentState, TranscriptStore};
+
+    #[test]
+    fn repeated_hypotheses_do_not_publish_unchanged_partials_or_delay_the_final() {
+        let mut utterance = UtteranceState::default();
+        let mut store = TranscriptStore::new();
+        utterance.observe("没有变化的字幕");
+        let partial = utterance.partial(400).unwrap();
+        store.apply(vec![partial.clone()]).unwrap();
+        for end_ms in [500, 600, 700] {
+            utterance.observe("没有变化的字幕");
+            assert!(utterance.partial(end_ms).is_none());
+        }
+
+        let final_segment = utterance.endpoint(800).unwrap();
+        assert_eq!(final_segment.id, partial.id);
+        assert_eq!(final_segment.text, partial.text);
+        assert_eq!(final_segment.start_ms, 0);
+        assert_eq!(final_segment.end_ms, 800);
+        assert_eq!(final_segment.revision, partial.revision + 1);
+        assert_eq!(final_segment.state, SegmentState::Final);
+        store.apply(vec![final_segment]).unwrap();
+        assert_eq!(store.segment_count(), 1);
+        assert_eq!(store.snapshot()[0].state, SegmentState::Final);
+        assert!(utterance.finish(800).is_none());
+    }
+
+    #[test]
+    fn partial_comparison_uses_the_displayed_sentence_case() {
+        let mut utterance = UtteranceState::default();
+        utterance.observe("HELLO THERE");
+        let first = utterance.partial(300).unwrap();
+        assert_eq!(first.text, "Hello there");
+        utterance.observe("Hello there");
+        assert!(utterance.partial(400).is_none());
+        utterance.observe("HELLO THERE FRIEND");
+        let changed = utterance.partial(500).unwrap();
+        assert_eq!(changed.id, first.id);
+        assert_eq!(changed.revision, first.revision + 1);
+        assert_eq!(changed.text, "Hello there friend");
+        assert_eq!(changed.end_ms, 500);
+    }
+
+    #[test]
+    fn hypotheses_that_revert_before_publication_do_not_repeat_the_displayed_text() {
+        let mut utterance = UtteranceState::default();
+        utterance.observe("已经显示的文字");
+        let first = utterance.partial(300).unwrap();
+        utterance.observe("临时改写的文字");
+        utterance.observe("已经显示的文字");
+        assert!(utterance.partial(400).is_none());
+        utterance.observe("确实变化的文字");
+        let changed = utterance.partial(500).unwrap();
+        assert_eq!(changed.id, first.id);
+        assert_eq!(changed.revision, first.revision + 1);
+        assert_eq!(changed.text, "确实变化的文字");
+        assert_eq!(utterance.finish(600).unwrap().text, changed.text);
+    }
+
+    #[test]
+    fn identical_text_in_the_next_utterance_keeps_its_own_partial_and_final() {
+        let mut utterance = UtteranceState::default();
+        utterance.observe("重复说的一句话");
+        let first_partial = utterance.partial(300).unwrap();
+        utterance.endpoint(500).unwrap();
+        utterance.observe("重复说的一句话");
+        let next_partial = utterance.partial(700).unwrap();
+        assert_ne!(next_partial.id, first_partial.id);
+        assert_eq!(next_partial.revision, 1);
+        assert_eq!(next_partial.start_ms, 500);
+        assert_eq!(next_partial.end_ms, 700);
+        utterance.observe("重复说的一句话");
+        assert!(utterance.partial(800).is_none());
+        let stopped = utterance.finish(850).unwrap();
+        assert_eq!(stopped.id, next_partial.id);
+        assert_eq!(stopped.text, next_partial.text);
+        assert_eq!(stopped.revision, 2);
+        assert_eq!(stopped.end_ms, 850);
+        assert_eq!(stopped.state, SegmentState::Final);
+        assert_eq!(utterance.builder.tracked(), 0);
+    }
 
     #[test]
     fn stop_finalizes_the_last_partial_without_a_new_recognizer_result() {

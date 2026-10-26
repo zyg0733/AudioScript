@@ -20,7 +20,7 @@ const DEFAULT_CONFIG: OverlayConfig = {
 }
 
 function OverlayApp() {
-  const { segments, error } = useTranscriptStream()
+  const { segments, error, reconnect, reconnecting } = useTranscriptStream()
   const [config, setConfig] = useState<OverlayConfig>(DEFAULT_CONFIG)
 
   useEffect(() => {
@@ -57,7 +57,10 @@ function OverlayApp() {
         opacity={config.opacity}
         bgColor={config.bgColor}
         glow={config.glow}
+        mode={config.mode}
         error={error}
+        onReconnect={reconnect}
+        reconnecting={reconnecting}
       />
       {config.mode === OverlayMode.Edit && <EditChrome />}
     </div>

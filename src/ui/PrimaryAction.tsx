@@ -1,10 +1,12 @@
 import { type CSSProperties, useCallback, useEffect, useRef, useState } from 'react'
+import { SessionPhase } from '@/shared/types'
 import { cn } from './cn'
 import { Icon } from './Icon'
 
 interface Props {
   capturing: boolean
   pending: boolean
+  phase?: SessionPhase
   disabledReason?: string
   activeDevice: string | null
   onToggle: () => void
@@ -89,17 +91,28 @@ const POOL: CSSProperties = {
   background: 'radial-gradient(80px circle at var(--px, 50%) var(--py, 50%), rgb(255 255 255 / 0.22), transparent 65%)',
 }
 
-export function PrimaryAction({ capturing, pending, disabledReason, activeDevice, onToggle }: Props) {
+export function PrimaryAction({ capturing, pending, phase, disabledReason, activeDevice, onToggle }: Props) {
   const { ref, onPointerMove } = useSpecularFollow()
   const elapsed = useElapsed(capturing)
 
-  const state = pending
-    ? { label: capturing ? '停止中…' : '启动中…', dot: 'bg-[var(--color-warn)] animate-pulse' }
-    : disabledReason
-      ? { label: disabledReason, dot: 'bg-[var(--color-warn)]' }
-      : capturing
-        ? { label: activeDevice ?? '采集中', dot: 'bg-[var(--color-danger)] animate-pulse' }
-        : { label: '就绪', dot: 'bg-[var(--color-success)]' }
+  const phaseLabel =
+    phase === SessionPhase.Preparing
+      ? '正在准备模型…'
+      : phase === SessionPhase.Finalizing
+        ? '正在整理末句与译文…'
+        : phase === SessionPhase.Processing
+          ? '正在处理资料…'
+          : null
+  const state =
+    phaseLabel || pending
+      ? { label: phaseLabel ?? (capturing ? '停止中…' : '启动中…'), dot: 'bg-[var(--color-warn)] animate-pulse' }
+      : disabledReason
+        ? { label: disabledReason, dot: 'bg-[var(--color-warn)]' }
+        : capturing
+          ? { label: activeDevice ?? '采集中', dot: 'bg-[var(--color-danger)] animate-pulse' }
+          : phase === SessionPhase.Error
+            ? { label: '会话已中断，可重新开始', dot: 'bg-[var(--color-warn)]' }
+            : { label: '就绪', dot: 'bg-[var(--color-success)]' }
 
   return (
     <div className="space-y-2">

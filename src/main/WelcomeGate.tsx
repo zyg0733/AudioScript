@@ -1,11 +1,27 @@
+import { useRef, useState } from 'react'
 import { PermissionPanel } from '@/main/permissions/PermissionPanel'
 import { useStore } from '@/main/store'
+import { Alert } from '@/ui/Alert'
 import { Button } from '@/ui/Button'
 import { TitleBarSpacer } from '@/ui/TitleBarSpacer'
 import { LogoMark } from './Brand'
 
 export function WelcomeGate() {
-  const { info, completeOnboarding } = useStore()
+  const { info, error, completeOnboarding } = useStore()
+  const [pendingAction, setPendingAction] = useState<'skip' | 'start' | null>(null)
+  const submitting = useRef(false)
+
+  async function finish(action: 'skip' | 'start') {
+    if (submitting.current) return
+    submitting.current = true
+    setPendingAction(action)
+    try {
+      await completeOnboarding()
+    } finally {
+      submitting.current = false
+      setPendingAction(null)
+    }
+  }
 
   return (
     <main className="flex h-full flex-col bg-[var(--color-surface-0)]">
@@ -19,12 +35,21 @@ export function WelcomeGate() {
             <p className="text-[var(--color-ink-1)] text-sm">请先确认系统权限</p>
           </header>
 
+          {error && (
+            <Alert tone="error" title="未能完成操作">
+              <p>{error}</p>
+              <p className="mt-1">请检查后重试。</p>
+            </Alert>
+          )}
+
           <PermissionPanel />
 
           <div className="flex items-center justify-between gap-3">
-            <Button onClick={() => void completeOnboarding()}>稍后再说</Button>
-            <Button variant="cta" onClick={() => void completeOnboarding()}>
-              开始使用
+            <Button disabled={pendingAction !== null} onClick={() => void finish('skip')}>
+              {pendingAction === 'skip' ? '正在保存…' : '稍后再说'}
+            </Button>
+            <Button variant="cta" disabled={pendingAction !== null} onClick={() => void finish('start')}>
+              {pendingAction === 'start' ? '正在保存…' : '开始使用'}
             </Button>
           </div>
 

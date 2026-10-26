@@ -16,6 +16,7 @@
     "lint:fix": "biome check --write src/ vite.config.ts vitest.config.ts",
     "test": "vitest run",
     "test:scripts": "node --test scripts/*.test.mjs",
+    "benchmark:models": "node scripts/benchmark-models.mjs",
     "test:watch": "vitest",
     "build:frontend": "vite build",
     "format": "biome format --write src/",

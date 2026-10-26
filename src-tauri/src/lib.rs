@@ -2,8 +2,10 @@ pub mod asr;
 pub mod audio;
 pub mod commands;
 pub mod config;
+pub mod library;
 pub mod lifecycle;
 pub mod log;
+pub mod media;
 pub mod models;
 pub mod overlay;
 pub mod paths;
@@ -17,6 +19,7 @@ pub mod transcript;
 pub mod translate;
 pub mod tray;
 pub mod update;
+pub mod workspace;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -124,6 +127,16 @@ pub fn run() {
             if let Err(e) = commands::init_executors() {
                 tracing::error!("{e}");
             }
+
+            let library_root = handle.path().app_data_dir()?.join("library");
+            let library = library::LibraryState::new(library_root).map_err(std::io::Error::other)?;
+            let repo = library.repo();
+            handle.manage(library);
+            let workspace = workspace::WorkspaceState::new(handle.clone(), repo).map_err(std::io::Error::other)?;
+            handle.manage(workspace);
+            handle.state::<workspace::WorkspaceState>().restore();
+            handle.manage(media::MediaState::new().map_err(std::io::Error::other)?);
+            handle.state::<media::MediaState>().init(&handle).map_err(std::io::Error::other)?;
 
             spawn_main_thread_watchdog(&handle);
 
@@ -312,6 +325,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => lifecycle::show_main(app),
             tauri::RunEvent::Exit => {
+                if let Some(media) = app.try_state::<media::MediaState>() { media.cancel_all(); }
+                if let Some(workspace) = app.try_state::<workspace::WorkspaceState>() { workspace.flush(); }
                 telemetry::track(app, "app_exited", None);
                 telemetry::flush(app);
             }

@@ -47,6 +47,22 @@ export async function call<T = unknown>(name: string, args: Record<string, unkno
   return invoke<T>('dispatch', { name, args })
 }
 
+export function libraryCall<T>(action: string, args: Record<string, unknown> = {}): Promise<T> {
+  return call<T>(`library_${action}`, args)
+}
+
+export function mediaCall<T>(action: string, args: Record<string, unknown> = {}): Promise<T> {
+  return call<T>(`media_${action}`, args)
+}
+
+export function workspaceCall<T>(action: string, args: Record<string, unknown> = {}): Promise<T> {
+  return call<T>(`workspace_${action}`, args)
+}
+
+export function retryTranslations(ids: string[]): Promise<void> {
+  return call<void>('session_retry_translation', { ids })
+}
+
 export const EVENT = {
   segments: 'transcript://segments',
   taskState: 'transcript://state',
@@ -90,7 +106,7 @@ export interface AutostartState {
 export interface ConfigDefaults {
   overlay: OverlayConfig
   endpoint: EndpointConfig
-  endpointProfiles: Record<'interpretation' | 'dictation', EndpointConfig>
+  endpointProfiles: Record<'interpretation' | 'dictation' | 'quickSubtitle', EndpointConfig>
 }
 
 export function appInfo(): Promise<AppInfo> {
