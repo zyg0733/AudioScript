@@ -104,6 +104,37 @@ export interface LibrarySource {
 	sourceLang?: string;
 }
 
+export interface LibrarySummary {
+	schemaVersion: number;
+	revision: number;
+	id: string;
+	title: string;
+	createdAt: number;
+	updatedAt: number;
+	source: LibrarySource;
+	segmentCount: number;
+	bookmarkCount: number;
+}
+
+export interface LibrarySearchHit {
+	recordId: string;
+	segmentId: string;
+	startMs: number;
+	field: string;
+	excerpt: string;
+}
+
+export interface LibraryReadIssue {
+	id: string;
+	error: string;
+}
+
+export interface LibraryListing {
+	records: LibrarySummary[];
+	hits: LibrarySearchHit[];
+	issues: LibraryReadIssue[];
+}
+
 export enum TranslationState {
 	Idle = "idle",
 	Pending = "pending",
@@ -169,18 +200,6 @@ export interface LibraryRecord {
 	updatedAt: number;
 	source: LibrarySource;
 	segments: LibrarySegment[];
-}
-
-export interface LibrarySummary {
-	schemaVersion: number;
-	revision: number;
-	id: string;
-	title: string;
-	createdAt: number;
-	updatedAt: number;
-	source: LibrarySource;
-	segmentCount: number;
-	bookmarkCount: number;
 }
 
 export enum MicPermission {

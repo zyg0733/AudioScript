@@ -1,6 +1,6 @@
 import { open } from '@tauri-apps/plugin-dialog'
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { dateLabel, fieldClass, panelClass } from '@/main/library/fields'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { dateLabel, fieldClass, panelClass, positionLabel } from '@/main/library/fields'
 import { LibraryRecordView } from '@/main/library/LibraryRecordView'
 import { formatCmdError, libraryCall, on, sessionStatus } from '@/shared/ipc'
 import {
@@ -11,7 +11,7 @@ import {
   mediaJobStatus,
   reprocessMediaRecord,
 } from '@/shared/media'
-import type { LibraryRecord, LibrarySummary } from '@/shared/types'
+import type { LibraryListing, LibraryReadIssue, LibraryRecord, LibrarySearchHit, LibrarySummary } from '@/shared/types'
 import { Alert } from '@/ui/Alert'
 import { Button } from '@/ui/Button'
 import { cn } from '@/ui/cn'
@@ -42,6 +42,10 @@ function publishJob(job: MediaJobInfo | null) {
 
 export function LibraryPage({ initialRecordId }: { initialRecordId?: string } = {}) {
   const [records, setRecords] = useState<LibrarySummary[]>([])
+  const [hits, setHits] = useState<LibrarySearchHit[]>([])
+  const [issues, setIssues] = useState<LibraryReadIssue[]>([])
+  const [visibleCount, setVisibleCount] = useState(50)
+  const [focus, setFocus] = useState<{ segmentId?: string; sequence: number }>({ sequence: 0 })
   const [record, setRecord] = useState<LibraryRecord | null>(null)
   const [query, setQuery] = useState('')
   const [loading, setLoading] = useState(true)
@@ -66,9 +70,11 @@ export function LibraryPage({ initialRecordId }: { initialRecordId?: string } = 
     const version = ++queryVersion.current
     setLoading(true)
     try {
-      const result = await libraryCall<LibrarySummary[]>('list', { query: search.trim() })
+      const result = await libraryCall<LibraryListing>('browse', { query: search.trim() })
       if (version !== queryVersion.current) return
-      setRecords(result)
+      setRecords(result.records)
+      setHits(result.hits)
+      setIssues(result.issues)
     } catch (e) {
       if (version === queryVersion.current) setError(`读取资料库失败：${formatCmdError(e)}`)
     } finally {
@@ -76,13 +82,16 @@ export function LibraryPage({ initialRecordId }: { initialRecordId?: string } = 
     }
   }, [])
 
-  const openRecord = useCallback(async (id: string) => {
+  const openRecord = useCallback(async (id: string, segmentId?: string) => {
     const version = ++openVersion.current
     setOpening(id)
     setError(null)
     try {
       const result = await libraryCall<LibraryRecord>('get', { id })
-      if (version === openVersion.current) setRecord(result)
+      if (version === openVersion.current) {
+        setRecord(result)
+        setFocus((current) => ({ segmentId, sequence: current.sequence + 1 }))
+      }
     } catch (e) {
       if (version === openVersion.current) setError(`打开记录失败：${formatCmdError(e)}`)
     } finally {
@@ -91,6 +100,7 @@ export function LibraryPage({ initialRecordId }: { initialRecordId?: string } = 
   }, [])
 
   useEffect(() => {
+    setVisibleCount(50)
     const timer = window.setTimeout(() => void refresh(query), query ? 250 : 0)
     return () => {
       window.clearTimeout(timer)
@@ -145,15 +155,23 @@ export function LibraryPage({ initialRecordId }: { initialRecordId?: string } = 
   useEffect(() => {
     if (!job || terminalStatuses.has(job.status)) return
     let disposed = false
-    const timer = window.setTimeout(() => {
+    let timer: number
+    const poll = () => {
       mediaJobStatus(job.jobId)
         .then((next) => {
-          if (!disposed) publishJob(next)
+          if (!disposed) {
+            setError((current) => (current?.startsWith('读取导入进度失败，正在重试') ? null : current))
+            publishJob(next)
+          }
         })
         .catch((e) => {
-          if (!disposed) setError(`读取导入进度失败：${formatCmdError(e)}`)
+          if (!disposed) {
+            setError(`读取导入进度失败，正在重试：${formatCmdError(e)}`)
+            timer = window.setTimeout(poll, 1500)
+          }
         })
-    }, 1000)
+    }
+    timer = window.setTimeout(poll, 1000)
     return () => {
       disposed = true
       window.clearTimeout(timer)
@@ -244,6 +262,7 @@ export function LibraryPage({ initialRecordId }: { initialRecordId?: string } = 
       publishJob(null)
       if (kind === 'subtitle') {
         const imported = await importSubtitleFile(path, {
+          sourceLang,
           ...(subtitleMediaPath ? { mediaPath: subtitleMediaPath } : {}),
         })
         setRecord(imported)
@@ -278,6 +297,9 @@ export function LibraryPage({ initialRecordId }: { initialRecordId?: string } = 
     const abort = new AbortController()
     mediaController = abort
     try {
+      const recordLanguage = record?.source.sourceLang
+      if (recordLanguage !== 'en' && recordLanguage !== 'zh')
+        throw new Error('请先在记录来源中设置原文语言，再生成精修记录。')
       const session = await sessionStatus()
       if (!session.actions.canStart)
         throw new Error(
@@ -288,7 +310,7 @@ export function LibraryPage({ initialRecordId }: { initialRecordId?: string } = 
         await reprocessMediaRecord(id, {
           mode,
           title,
-          sourceLang,
+          sourceLang: recordLanguage,
           translate: mode === 'translate' ? true : translate,
           signal: abort.signal,
           onProgress: publishJob,
@@ -314,6 +336,11 @@ export function LibraryPage({ initialRecordId }: { initialRecordId?: string } = 
   }
 
   const activeJob = importing || Boolean(job && !terminalStatuses.has(job.status))
+  const recordHits = useMemo(() => {
+    const result = new Map<string, LibrarySearchHit[]>()
+    for (const hit of hits) result.set(hit.recordId, [...(result.get(hit.recordId) ?? []), hit])
+    return result
+  }, [hits])
 
   return (
     <div className="mx-auto max-w-6xl space-y-5 px-6 py-6">
@@ -351,11 +378,26 @@ export function LibraryPage({ initialRecordId }: { initialRecordId?: string } = 
         </Alert>
       )}
       {notice && <Alert tone="info">{notice}</Alert>}
+      {issues.length > 0 && (
+        <Alert tone="warn" title={`${issues.length} 条记录暂时无法读取`}>
+          其余资料可以继续使用，无法读取的原文件已保留。
+          <details className="mt-2">
+            <summary className="cursor-pointer">查看受影响记录</summary>
+            <ul className="mt-2 space-y-1 break-all">
+              {issues.map((issue) => (
+                <li key={issue.id}>
+                  {issue.id}：{issue.error}
+                </li>
+              ))}
+            </ul>
+          </details>
+        </Alert>
+      )}
       <details className={panelClass}>
         <summary className="cursor-pointer text-xs">导入与精修选项</summary>
         <div className="mt-3 flex flex-wrap items-center gap-3">
           <Select
-            label="媒体原文语言"
+            label="导入原文语言"
             value={sourceLang}
             onChange={setSourceLang}
             disabled={activeJob}
@@ -364,6 +406,7 @@ export function LibraryPage({ initialRecordId }: { initialRecordId?: string } = 
               { value: 'zh', label: '中文' },
             ]}
           />
+          <p className="text-[var(--color-ink-2)] text-xs">精修使用记录中保存的原文语言，可在记录来源中修改。</p>
           <label className="flex items-center gap-1 text-xs">
             <input
               type="checkbox"
@@ -426,7 +469,7 @@ export function LibraryPage({ initialRecordId }: { initialRecordId?: string } = 
             </p>
           )}
           <ul className="max-h-[68vh] space-y-2 overflow-y-auto">
-            {records.map((item) => (
+            {records.slice(0, visibleCount).map((item) => (
               <li key={item.id}>
                 <button
                   type="button"
@@ -444,14 +487,35 @@ export function LibraryPage({ initialRecordId }: { initialRecordId?: string } = 
                     {item.segmentCount} 段 · {item.bookmarkCount} 个标记
                   </span>
                 </button>
+                {recordHits.get(item.id)?.map((hit) => (
+                  <button
+                    key={hit.segmentId}
+                    type="button"
+                    className="mt-1 block w-full rounded-[var(--radius-ctl)] border-[var(--color-border-subtle)] border-l-2 p-2 text-left text-xs hover:bg-[var(--color-surface-2)]"
+                    aria-label={`定位${hit.field} ${positionLabel(hit.startMs)}`}
+                    onClick={() => void openRecord(item.id, hit.segmentId)}
+                  >
+                    <span className="text-[var(--color-ink-2)]">
+                      {hit.field} · {positionLabel(hit.startMs)}
+                    </span>
+                    <span className="mt-1 block whitespace-pre-wrap break-words">{hit.excerpt}</span>
+                  </button>
+                ))}
               </li>
             ))}
           </ul>
+          {records.length > visibleCount && (
+            <Button size="sm" onClick={() => setVisibleCount((count) => count + 50)}>
+              查看更多（剩余 {records.length - visibleCount} 条）
+            </Button>
+          )}
         </aside>
         {record ? (
           <LibraryRecordView
             key={record.id}
             record={record}
+            initialSegmentId={focus.segmentId}
+            focusSequence={focus.sequence}
             onChanged={onChanged}
             onDeleted={onDeleted}
             onReprocess={(id, mode) => void reprocess(id, mode)}

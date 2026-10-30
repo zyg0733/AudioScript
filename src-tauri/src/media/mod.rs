@@ -15,9 +15,9 @@ use tauri::{AppHandle, Manager};
 
 use crate::asr::streaming::StreamingAdapter;
 use crate::config::{target_lang_for, AsrConfig, TranslateConfig};
-use crate::library::{LibrarySource, LibrarySourceKind, LibraryState};
+use crate::library::{LibraryRecord, LibrarySource, LibrarySourceKind, LibraryState, Repository};
 use crate::transcript::TranscriptSegment;
-use crate::translate::{local_nmt::LocalNmt, Translator};
+use crate::translate::local_nmt::LocalNmt;
 
 const MAX_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ACTIVE_JOBS: usize = 4;
@@ -371,6 +371,126 @@ fn options(args: &Value) -> Result<ProcessOptions, String> {
         .map_err(|e| format!("媒体任务参数无效：{e}"))
 }
 
+fn import_subtitles(
+    repo: &Repository,
+    root: &Path,
+    args: &Value,
+    default_language: &str,
+) -> Result<LibraryRecord, String> {
+    let source_lang = match args.get("sourceLang") {
+        None => default_language,
+        Some(Value::String(language)) => language,
+        _ => return Err("字幕语言必须为英语或中文".into()),
+    };
+    if !matches!(source_lang, "en" | "zh") {
+        return Err("字幕语言必须为英语或中文".into());
+    }
+    let path = local_file(string(args, "path")?, subtitles::MAX_SUBTITLE_BYTES as u64)?;
+    if !matches!(
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_lowercase)
+            .as_deref(),
+        Some("srt" | "vtt")
+    ) {
+        return Err("请选择 .srt 或 .vtt 字幕文件".into());
+    }
+    let text =
+        std::fs::read_to_string(&path).map_err(|_| "字幕必须是有效 UTF-8 文本，请先转换编码")?;
+    let segments = subtitles::parse(&text)?;
+    let title = args
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("导入字幕")
+        })
+        .trim();
+    if title.is_empty() || title.chars().count() > 240 {
+        return Err("资料标题须为 1 到 240 字".into());
+    }
+    let mut source = if let Some(media_path) = args.get("mediaPath").and_then(Value::as_str) {
+        source_for(&copy_media(root, media_path)?)
+    } else {
+        LibrarySource {
+            kind: LibrarySourceKind::Subtitle,
+            label: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            url: None,
+            id: Some(uuid::Uuid::new_v4().to_string()),
+            media_path: None,
+            pcm_path: None,
+            duration_ms: segments.iter().map(|s| s.end_ms).max(),
+            derived_from_id: None,
+            source_lang: None,
+        }
+    };
+    source.kind = LibrarySourceKind::Subtitle;
+    source.source_lang = Some(source_lang.into());
+    // 保存可能在替换记录后因目录同步失败而报错，此时仍须保留记录引用的媒体。
+    repo.create_record(title.to_string(), source, segments)
+}
+
+fn prepare_reprocess(
+    record: &LibraryRecord,
+    root: &Path,
+    args: &Value,
+) -> Result<(LibrarySource, ProcessOptions, Option<ManagedMedia>), String> {
+    let mut options = options(args)?;
+    let mut source = record.source.clone();
+    if args
+        .get("options")
+        .and_then(|o| o.get("sourceLang"))
+        .is_none()
+    {
+        options.source_lang = source
+            .source_lang
+            .clone()
+            .ok_or("此资料尚未设置原文语言，请先选择英语或中文再处理")?;
+    }
+    options.validate()?;
+    source.source_lang = Some(options.source_lang.clone());
+    source.derived_from_id = Some(record.id.clone());
+    let mut media = None;
+    if options.mode != "translate" {
+        if let Some(path) = source.media_path.as_deref() {
+            let path = managed_path(root, path)?;
+            media = Some(ManagedMedia {
+                source_id: source
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                size_bytes: std::fs::metadata(&path).map_err(|e| e.to_string())?.len(),
+                original_name: source.label.clone(),
+                kind: if matches!(
+                    path.extension().and_then(|s| s.to_str()),
+                    Some("mp4" | "m4v" | "mov" | "webm" | "mkv")
+                ) {
+                    "video"
+                } else {
+                    "audio"
+                }
+                .into(),
+                path: path.to_string_lossy().into_owned(),
+            });
+        }
+        if let Some(path) = source.pcm_path.as_deref() {
+            pcm::inspect_wav(&managed_path(root, path)?)?;
+        }
+        if media.is_none() && source.pcm_path.is_none() {
+            options.mode = "translate".into();
+        }
+    }
+    if options.title.is_none() {
+        options.title = Some(format!("{} · 新版本", record.title));
+    }
+    Ok((source, options, media))
+}
+
 pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, String> {
     let state = app.state::<MediaState>();
     match name {
@@ -393,112 +513,18 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, String>
             };
             Ok(json!({"job":job,"media":media,"pcmReady":pcm_ready}))
         }
-        "media_import_subtitles" => {
-            let path = local_file(string(args, "path")?, subtitles::MAX_SUBTITLE_BYTES as u64)?;
-            if !matches!(
-                path.extension()
-                    .and_then(|s| s.to_str())
-                    .map(str::to_lowercase)
-                    .as_deref(),
-                Some("srt" | "vtt")
-            ) {
-                return Err("请选择 .srt 或 .vtt 字幕文件".into());
-            }
-            let text = std::fs::read_to_string(&path)
-                .map_err(|_| "字幕必须是有效 UTF-8 文本，请先转换编码")?;
-            let segments = subtitles::parse(&text)?;
-            let mut source = if let Some(media_path) = args.get("mediaPath").and_then(Value::as_str)
-            {
-                let media_path = local_file(media_path, MAX_MEDIA_BYTES)?;
-                if media_path.parent() != path.parent() {
-                    return Err("绑定媒体必须由你明确选择，并与字幕位于同一目录".into());
-                }
-                source_for(&copy_media(&state.root()?, &media_path.to_string_lossy())?)
-            } else {
-                LibrarySource {
-                    kind: LibrarySourceKind::Subtitle,
-                    label: path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                    url: None,
-                    id: Some(uuid::Uuid::new_v4().to_string()),
-                    media_path: None,
-                    pcm_path: None,
-                    duration_ms: segments.last().map(|s| s.end_ms),
-                    derived_from_id: None,
-                    source_lang: None,
-                }
-            };
-            source.kind = LibrarySourceKind::Subtitle;
-            let title = args
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| {
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("导入字幕")
-                });
-            Ok(json!(app.state::<LibraryState>().repo().create_record(
-                title.to_string(),
-                source,
-                segments
-            )?))
-        }
+        "media_import_subtitles" => Ok(json!(import_subtitles(
+            &app.state::<LibraryState>().repo(),
+            &state.root()?,
+            args,
+            &crate::prefs::load(app).source_lang,
+        )?)),
         "media_reprocess" => {
             let record = app
                 .state::<LibraryState>()
                 .repo()
                 .get(string(args, "recordId")?)?;
-            let mut options = options(args)?;
-            options.validate()?;
-            let mut source = record.source.clone();
-            if args
-                .get("options")
-                .and_then(|o| o.get("sourceLang"))
-                .is_none()
-            {
-                if let Some(language) = source.source_lang.as_ref() {
-                    options.source_lang = language.clone();
-                }
-            }
-            source.source_lang = Some(options.source_lang.clone());
-            source.derived_from_id = Some(record.id.clone());
-            let root = state.root()?;
-            let media = match source.media_path.as_deref() {
-                Some(path) => {
-                    let path = managed_path(&root, path)?;
-                    Some(ManagedMedia {
-                        source_id: source
-                            .id
-                            .clone()
-                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                        size_bytes: std::fs::metadata(&path).map_err(|e| e.to_string())?.len(),
-                        original_name: source.label.clone(),
-                        kind: if matches!(
-                            path.extension().and_then(|s| s.to_str()),
-                            Some("mp4" | "m4v" | "mov" | "webm" | "mkv")
-                        ) {
-                            "video"
-                        } else {
-                            "audio"
-                        }
-                        .into(),
-                        path: path.to_string_lossy().into_owned(),
-                    })
-                }
-                None => None,
-            };
-            if let Some(path) = source.pcm_path.as_deref() {
-                pcm::inspect_wav(&managed_path(&root, path)?)?;
-            }
-            if media.is_none() && source.pcm_path.is_none() {
-                options.mode = "translate".into();
-            }
-            if options.title.is_none() {
-                options.title = Some(format!("{} · 新版本", record.title));
-            }
+            let (source, options, media) = prepare_reprocess(&record, &state.root()?, args)?;
             let pcm_ready = source.pcm_path.is_some();
             let translate_only = options.mode == "translate";
             let job = state.add_job(
@@ -711,25 +737,19 @@ fn execute(shared: &Mutex<Shared>, task: &Task) -> Result<(), String> {
     let failed = if task.options.translate {
         worker::check_cancel(&task.cancel)?;
         progress(shared, &task.job_id, "translating", 71.0);
-        let model = crate::paths::locate_mt_root(&roots, prefs.mt_model_tier)?;
-        let mut translator = LocalNmt::new(model.path.clone(), prefs.mt_model_tier);
-        let config = TranslateConfig {
+        let mut config = TranslateConfig {
             source_lang: task.options.source_lang.clone(),
             target_lang: target_lang_for(&task.options.source_lang).into(),
             zh_script: prefs.zh_script,
-            model_dir: Some(model.path.to_string_lossy().into_owned()),
             ..Default::default()
         };
-        let initialized = translator
-            .init(&config)
-            .map_err(|e| format!("离线翻译初始化失败：{e}"));
-        let result = initialized.and_then(|_| {
-            worker::translate_all(&mut translator, &mut segments, &task.cancel, |p| {
-                progress(shared, &task.job_id, "translating", 71.0 + p * 25.0)
-            })
+        let translator = crate::paths::locate_mt_root(&roots, prefs.mt_model_tier).map(|model| {
+            config.model_dir = Some(model.path.to_string_lossy().into_owned());
+            LocalNmt::new(model.path, prefs.mt_model_tier)
         });
-        translator.shutdown();
-        result?
+        worker::translate_prepared(translator, &config, &mut segments, &task.cancel, |p| {
+            progress(shared, &task.job_id, "translating", 71.0 + p * 25.0)
+        })?
     } else {
         0
     };
@@ -775,6 +795,91 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
         dunce::canonicalize(path).unwrap()
     }
+
+    #[test]
+    fn subtitle_import_keeps_language_and_copies_explicit_media_from_another_directory() {
+        let root = fixture_root();
+        let outside = fixture_root();
+        let repo = Repository::new(root.join("library")).unwrap();
+        let media_root = root.join("managed");
+        std::fs::create_dir(&media_root).unwrap();
+        let subtitles = root.join("lecture.srt");
+        std::fs::write(&subtitles, "1\n00:00:00,000 --> 00:00:01,000\n你好\n").unwrap();
+        let media = outside.join("lecture.mp3");
+        std::fs::write(&media, b"original media").unwrap();
+        let args = json!({"path":subtitles,"mediaPath":media,"sourceLang":"zh"});
+        let imported = import_subtitles(&repo, &media_root, &args, "en").unwrap();
+        let reopened = repo.get(&imported.id).unwrap();
+        assert_eq!(reopened.source.source_lang.as_deref(), Some("zh"));
+        assert_eq!(reopened.source.kind, LibrarySourceKind::Subtitle);
+        assert_eq!(reopened.segments[0].segment.text, "你好");
+        let managed = Path::new(reopened.source.media_path.as_ref().unwrap());
+        assert!(managed.starts_with(&media_root));
+        assert_ne!(managed, media);
+        assert_eq!(std::fs::read(managed).unwrap(), b"original media");
+        assert_eq!(std::fs::read(&media).unwrap(), b"original media");
+        std::fs::remove_file(managed).unwrap();
+        let mut missing_media = reopened.clone();
+        missing_media.source.pcm_path = Some(media_root.join("missing.wav").display().to_string());
+        let (derived, options, prepared_media) = prepare_reprocess(
+            &missing_media,
+            &media_root,
+            &json!({"options":{"mode":"translate"}}),
+        )
+        .unwrap();
+        assert_eq!(options.source_lang, "zh");
+        assert_eq!(derived.media_path, missing_media.source.media_path);
+        assert_eq!(
+            derived.derived_from_id.as_deref(),
+            Some(reopened.id.as_str())
+        );
+        assert!(prepared_media.is_none());
+        assert!(prepare_reprocess(
+            &missing_media,
+            &media_root,
+            &json!({"options":{"mode":"transcribe"}}),
+        )
+        .is_err());
+        missing_media.source.source_lang = None;
+        assert!(prepare_reprocess(
+            &missing_media,
+            &media_root,
+            &json!({"options":{"mode":"translate"}}),
+        )
+        .unwrap_err()
+        .contains("原文语言"));
+        assert!(prepare_reprocess(
+            &missing_media,
+            &media_root,
+            &json!({"options":{"mode":"translate","sourceLang":"zh"}}),
+        )
+        .is_ok());
+        missing_media.source.source_lang = Some("fr".into());
+        assert!(prepare_reprocess(
+            &missing_media,
+            &media_root,
+            &json!({"options":{"mode":"translate"}}),
+        )
+        .is_err());
+        let fallback =
+            import_subtitles(&repo, &media_root, &json!({"path":subtitles}), "zh").unwrap();
+        assert_eq!(fallback.source.source_lang.as_deref(), Some("zh"));
+        for invalid in [json!("fr"), json!(null), json!(true)] {
+            let args = json!({"path":subtitles,"mediaPath":media,"sourceLang":invalid});
+            assert!(import_subtitles(&repo, &media_root, &args, "en").is_err());
+        }
+        assert!(import_subtitles(
+            &repo,
+            &media_root,
+            &json!({"path":subtitles,"mediaPath":media,"title":" "}),
+            "en",
+        )
+        .is_err());
+        assert_eq!(std::fs::read_dir(&media_root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
     #[test]
     fn restart_removes_only_our_unfinished_parts_and_keeps_managed_media() {
         let root = fixture_root();

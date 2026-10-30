@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::asr::AsrEngine;
-use crate::config::AsrConfig;
+use crate::config::{AsrConfig, TranslateConfig};
 use crate::transcript::{SegmentState, TranscriptSegment, TranscriptStore, TranslationState};
 use crate::translate::Translator;
 
@@ -122,6 +122,42 @@ pub fn translate_all<T: Translator + ?Sized>(
     Ok(failed)
 }
 
+pub fn translate_prepared<T: Translator>(
+    translator: Result<T, String>,
+    config: &TranslateConfig,
+    segments: &mut [TranscriptSegment],
+    cancel: &AtomicBool,
+    progress: impl FnMut(f32),
+) -> Result<u32, String> {
+    check_cancel(cancel)?;
+    let mut translator = match translator {
+        Ok(translator) => translator,
+        Err(error) => return Ok(mark_translation_failed(segments, &error)),
+    };
+    let result = (|| match translator.init(config) {
+        Ok(()) => translate_all(&mut translator, segments, cancel, progress),
+        Err(error) => {
+            check_cancel(cancel)?;
+            Ok(mark_translation_failed(
+                segments,
+                &format!("离线翻译初始化失败：{error}"),
+            ))
+        }
+    })();
+    translator.shutdown();
+    result
+}
+
+fn mark_translation_failed(segments: &mut [TranscriptSegment], error: &str) -> u32 {
+    for segment in segments.iter_mut() {
+        segment.translation = None;
+        segment.translation_state = TranslationState::Failed;
+        segment.translation_error = Some(error.to_owned());
+        segment.revision = segment.revision.saturating_add(1);
+    }
+    segments.len() as u32
+}
+
 pub fn new_version(segments: Vec<TranscriptSegment>) -> Vec<TranscriptSegment> {
     segments
         .into_iter()
@@ -142,7 +178,6 @@ pub fn new_version(segments: Vec<TranscriptSegment>) -> Vec<TranscriptSegment> {
 mod tests {
     use super::*;
     use crate::asr::{AsrError, EngineCaps};
-    use crate::config::TranslateConfig;
     use crate::translate::{TranslateCaps, TranslateError};
     use base64::Engine;
 
@@ -270,6 +305,68 @@ mod tests {
             .contains("失败原因"));
         assert_eq!(segments[2].translation_state, TranslationState::Done);
     }
+
+    #[test]
+    fn unavailable_translation_preserves_recognized_text_for_saving_and_retry() {
+        struct Unavailable(std::sync::Arc<AtomicBool>);
+        impl Translator for Unavailable {
+            fn init(&mut self, _: &TranslateConfig) -> Result<(), TranslateError> {
+                Err(TranslateError::ModelLoad("模型文件损坏".into()))
+            }
+            fn capabilities(&self) -> TranslateCaps {
+                TranslateCaps::LOCAL_NMT
+            }
+            fn translate(&mut self, _: &str) -> Result<String, TranslateError> {
+                panic!("初始化失败不得调用翻译")
+            }
+            fn shutdown(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        for engine in [
+            Err("未找到本地翻译模型".to_owned()),
+            Ok(Unavailable(stopped.clone())),
+        ] {
+            let original = segments();
+            let mut result = original.clone();
+            assert_eq!(
+                translate_prepared(
+                    engine,
+                    &TranslateConfig::default(),
+                    &mut result,
+                    &AtomicBool::new(false),
+                    |_| {},
+                )
+                .unwrap(),
+                result.len() as u32,
+            );
+            for (before, after) in original.iter().zip(&result) {
+                assert_eq!(after.id, before.id);
+                assert_eq!(after.text, before.text);
+                assert_eq!(after.start_ms, before.start_ms);
+                assert_eq!(after.end_ms, before.end_ms);
+                assert!(after.is_persistable());
+                assert_eq!(after.translation_state, TranslationState::Failed);
+                assert!(after.translation_error.as_ref().unwrap().contains("模型"));
+                assert!(after.translation.is_none());
+                assert_eq!(after.revision, before.revision + 1);
+            }
+        }
+        assert!(stopped.load(Ordering::Acquire));
+        let original = segments();
+        let mut cancelled = original.clone();
+        assert!(translate_prepared::<Unavailable>(
+            Err("未找到本地翻译模型".into()),
+            &TranslateConfig::default(),
+            &mut cancelled,
+            &AtomicBool::new(true),
+            |_| {},
+        )
+        .is_err());
+        assert_eq!(cancelled, original);
+    }
+
     #[test]
     fn cancellation_stops_batch_and_new_versions_never_overwrite_original_segment_identity() {
         let original = segments();

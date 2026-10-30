@@ -84,15 +84,144 @@ fn source_label_edits_preserve_language_media_and_unspecified_link() {
         .create_record("来源".into(), source(), Vec::new())
         .unwrap();
     let renamed = repo
-        .update_source(&record.id, "新来源名称".into(), None)
+        .update_source(&record.id, "新来源名称".into(), None, None)
         .unwrap();
     assert_eq!(renamed.source.url, record.source.url);
     assert_eq!(renamed.source.source_lang.as_deref(), Some("en"));
     let cleared = repo
-        .update_source(&record.id, "新来源名称".into(), Some(String::new()))
+        .update_source(&record.id, "新来源名称".into(), Some(String::new()), None)
         .unwrap();
     assert!(cleared.source.url.is_none());
     assert_eq!(cleared.source.id, record.source.id);
+    let changed = repo
+        .update_source(&record.id, "中文资料".into(), None, Some("zh".into()))
+        .unwrap();
+    assert_eq!(changed.source.source_lang.as_deref(), Some("zh"));
+    assert!(repo
+        .update_source(&record.id, "无效".into(), None, Some("xx".into()))
+        .is_err());
+    assert_eq!(repo.get(&record.id).unwrap(), changed);
+}
+
+#[test]
+fn damaged_and_future_records_do_not_hide_readable_records_or_get_overwritten() {
+    let repo = repository();
+    let good = repo
+        .create_record("可读取".into(), source(), vec![segment("one", "hello", 1)])
+        .unwrap();
+    let broken_id = uuid::Uuid::new_v4().to_string();
+    let broken_path = repo
+        .root()
+        .join("records")
+        .join(format!("{broken_id}.json"));
+    std::fs::write(&broken_path, b"{broken").unwrap();
+    let mut future = good.clone();
+    future.id = uuid::Uuid::new_v4().to_string();
+    future.schema_version = 100;
+    let future_path = repo
+        .root()
+        .join("records")
+        .join(format!("{}.json", future.id));
+    std::fs::write(&future_path, serde_json::to_vec(&future).unwrap()).unwrap();
+    let listing = repo.browse(None).unwrap();
+    assert_eq!(listing.records.len(), 1);
+    assert_eq!(listing.records[0].id, good.id);
+    assert_eq!(listing.issues.len(), 2);
+    assert_eq!(std::fs::read(broken_path).unwrap(), b"{broken");
+    assert!(future_path.exists());
+    assert!(repo.get(&broken_id).is_err());
+}
+
+#[test]
+fn source_language_change_rejects_inflight_translations_and_preserves_previous_text() {
+    let repo = repository();
+    let record = repo
+        .create_record(
+            "方向切换".into(),
+            source(),
+            vec![segment("one", "中文原文", 1)],
+        )
+        .unwrap();
+    let original = &record.segments[0];
+    let changed = repo
+        .update_source(&record.id, "课程".into(), None, Some("zh".into()))
+        .unwrap();
+    assert!(repo
+        .set_translation(
+            &record.id,
+            "one",
+            original.source_revision,
+            original.segment.revision,
+            "旧方向结果".into()
+        )
+        .is_err());
+    assert_eq!(
+        changed.segments[0].segment.translation,
+        original.segment.translation
+    );
+    assert_eq!(
+        changed.segments[0].segment.translation_state,
+        TranslationState::Failed
+    );
+    let current = &changed.segments[0];
+    let translated = repo
+        .set_translation(
+            &record.id,
+            "one",
+            current.source_revision,
+            current.segment.revision,
+            "Chinese original".into(),
+        )
+        .unwrap();
+    assert_eq!(
+        translated.segments[0].segment.translation.as_deref(),
+        Some("Chinese original")
+    );
+    assert!(repo
+        .save_live(
+            Some(&record.id),
+            "旧会话".into(),
+            source(),
+            vec![segment("one", "旧方向翻译", 9)]
+        )
+        .is_err());
+    assert_eq!(repo.get(&record.id).unwrap(), translated);
+}
+
+#[test]
+fn library_search_returns_bounded_context_and_real_segment_targets() {
+    let repo = repository();
+    let record = repo
+        .create_record(
+            "搜索".into(),
+            source(),
+            vec![
+                segment(
+                    "one",
+                    &format!("{}İSTANBUL{}", "前文".repeat(100), "后文".repeat(100)),
+                    1,
+                ),
+                segment("two", "second", 1),
+            ],
+        )
+        .unwrap();
+    let result = repo.browse(Some("İstanbul")).unwrap();
+    assert_eq!(result.records.len(), 1);
+    assert_eq!(result.hits.len(), 1);
+    let hit = &result.hits[0];
+    assert_eq!(hit.record_id, record.id);
+    assert_eq!(hit.segment_id, "one");
+    assert_eq!(hit.start_ms, 200);
+    assert!(hit.excerpt.contains("İSTANBUL"));
+    assert!(hit.excerpt.chars().count() <= 162);
+    let mut change = patch(1);
+    change.note = Some("以后复习内存问题".into());
+    repo.update_segment(&record.id, "two", change).unwrap();
+    let note = repo.browse(Some("复习")).unwrap();
+    assert_eq!(note.hits[0].segment_id, "two");
+    assert_eq!(note.hits[0].field, "笔记");
+    assert_eq!(repo.browse(Some("事务")).unwrap().hits[0].field, "译文");
+    assert!(repo.browse(None).unwrap().hits.is_empty());
 }
 
 #[test]

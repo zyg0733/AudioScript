@@ -51,7 +51,7 @@ export function cancelMediaJob(jobId: string): Promise<MediaJobInfo> {
 
 export function importSubtitleFile(
   path: string,
-  options: { mediaPath?: string; title?: string } = {},
+  options: { mediaPath?: string; title?: string; sourceLang?: 'en' | 'zh' } = {},
 ): Promise<LibraryRecord> {
   return call<LibraryRecord>('media_import_subtitles', { path, ...options })
 }

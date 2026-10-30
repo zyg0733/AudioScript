@@ -7,6 +7,7 @@ import { Alert } from '@/ui/Alert'
 import { Button } from '@/ui/Button'
 import { cn } from '@/ui/cn'
 import { Select } from '@/ui/Select'
+import { clearDrafts, draftChanged, type EntryDraft, readDrafts, writeDrafts } from './drafts'
 import { dateLabel, fieldClass, panelClass, positionLabel } from './fields'
 import { LibraryMediaPlayer, type PlaybackTarget } from './LibraryMediaPlayer'
 import { LibraryTermsPanel } from './LibraryTermsPanel'
@@ -20,13 +21,24 @@ interface Props {
   onDeleted: (id: string) => void
   onReprocess: (id: string, mode: 'transcribe' | 'translate') => void
   reprocessing: boolean
+  initialSegmentId?: string
+  focusSequence?: number
 }
 
-export function LibraryRecordView({ record, onChanged, onDeleted, onReprocess, reprocessing }: Props) {
+export function LibraryRecordView({
+  record,
+  onChanged,
+  onDeleted,
+  onReprocess,
+  reprocessing,
+  initialSegmentId,
+  focusSequence,
+}: Props) {
   const [tab, setTab] = useState<Tab>('transcript')
   const [title, setTitle] = useState(record.title)
   const [sourceLabel, setSourceLabel] = useState(record.source.label)
   const [sourceUrl, setSourceUrl] = useState(record.source.url ?? '')
+  const [sourceLang, setSourceLang] = useState(record.source.sourceLang ?? '')
   const [sourceEditing, setSourceEditing] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [pending, setPending] = useState<string | null>(null)
@@ -44,13 +56,16 @@ export function LibraryRecordView({ record, onChanged, onDeleted, onReprocess, r
   const [answer, setAnswer] = useState<LibraryAnswer | null>(null)
   const [playback, setPlayback] = useState<PlaybackTarget | null>(null)
   const [focused, setFocused] = useState<string | null>(null)
+  const [drafts, setDrafts] = useState(() => readDrafts(record.id))
   const sequence = useRef(0)
+  const jumpRef = useRef<(id: string) => void>(() => {})
 
   useEffect(() => setTitle(record.title), [record.title])
   useEffect(() => {
     setSourceLabel(record.source.label)
     setSourceUrl(record.source.url ?? '')
-  }, [record.source.label, record.source.url])
+    setSourceLang(record.source.sourceLang ?? '')
+  }, [record.source.label, record.source.url, record.source.sourceLang])
   // biome-ignore lint/correctness/useExhaustiveDependencies: 记录修订后原文证据需要重新生成。
   useEffect(() => {
     setAnalysis(null)
@@ -87,6 +102,11 @@ export function LibraryRecordView({ record, onChanged, onDeleted, onReprocess, r
   }
 
   function retranslate(ids: string[]) {
+    if (!record.source.sourceLang) {
+      setSourceEditing(true)
+      setError('请先在来源设置中选择并保存原文语言，再重新翻译。')
+      return Promise.resolve(false)
+    }
     return perform('retranslate', async () => {
       for (let start = 0; start < ids.length; start += 50) {
         const next = await libraryCall<LibraryRecord>('retranslate', {
@@ -107,6 +127,27 @@ export function LibraryRecordView({ record, onChanged, onDeleted, onReprocess, r
     const index = record.segments.findIndex((value) => value.segment.id === entry.id)
     setPage(Math.floor(Math.max(0, index) / 100) + 1)
     setPlayback({ startMs: entry.startMs, endMs: entry.endMs, play, sequence: ++sequence.current })
+  }
+
+  jumpRef.current = (id) => {
+    const entry = record.segments.find((value) => value.segment.id === id)
+    if (entry) jump(entry.segment)
+  }
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 同一条搜索结果可再次定位，正文后台更新不应重复跳转。
+  useEffect(() => {
+    if (initialSegmentId) jumpRef.current(initialSegmentId)
+  }, [record.id, initialSegmentId, focusSequence])
+
+  function changeDraft(id: string, update: (current: EntryDraft) => EntryDraft) {
+    setDrafts((current) => {
+      const next = { ...current }
+      const draft = update(current[id] ?? {})
+      if (draft.textEdit || draft.noteEdit) next[id] = draft
+      else delete next[id]
+      writeDrafts(record.id, next)
+      return next
+    })
   }
 
   useEffect(() => {
@@ -149,6 +190,9 @@ export function LibraryRecordView({ record, onChanged, onDeleted, onReprocess, r
         )),
   )
   const busy = pending !== null
+  const dirtyEntries = record.segments.filter(
+    (entry) => drafts[entry.segment.id] && draftChanged(drafts[entry.segment.id]),
+  )
   const mediaPath = record.source.mediaPath
   const pages = Math.max(1, Math.ceil(visible.length / 100))
   const currentPage = Math.min(page, pages)
@@ -177,6 +221,14 @@ export function LibraryRecordView({ record, onChanged, onDeleted, onReprocess, r
         </Alert>
       )}
       {notice && <Alert tone="info">{notice}</Alert>}
+      {dirtyEntries.length > 0 && (
+        <Alert tone="info">
+          {dirtyEntries.length} 段有未保存修改。切换记录或页面会保留草稿，请保存后再退出应用。
+          <Button size="sm" className="ml-2" onClick={() => jump(dirtyEntries[0].segment)}>
+            继续修订
+          </Button>
+        </Alert>
+      )}
       <div className={`${panelClass} space-y-3`}>
         <div className="flex items-start gap-2">
           <input
@@ -203,11 +255,19 @@ export function LibraryRecordView({ record, onChanged, onDeleted, onReprocess, r
           <Button size="sm" variant="ghost" onClick={() => setSourceEditing((value) => !value)}>
             来源
           </Button>
-          <Button size="sm" disabled={busy || reprocessing} onClick={() => onReprocess(record.id, 'translate')}>
+          <Button
+            size="sm"
+            disabled={busy || reprocessing || !record.source.sourceLang}
+            onClick={() => onReprocess(record.id, 'translate')}
+          >
             译文另存精修版
           </Button>
           {mediaPath && (
-            <Button size="sm" disabled={busy || reprocessing} onClick={() => onReprocess(record.id, 'transcribe')}>
+            <Button
+              size="sm"
+              disabled={busy || reprocessing || !record.source.sourceLang}
+              onClick={() => onReprocess(record.id, 'transcribe')}
+            >
               重新识别
             </Button>
           )}
@@ -221,6 +281,7 @@ export function LibraryRecordView({ record, onChanged, onDeleted, onReprocess, r
                   onClick={() =>
                     void perform('delete', async () => {
                       await libraryCall('delete', { id: record.id })
+                      clearDrafts(record.id)
                       onDeleted(record.id)
                     })
                   }
@@ -239,8 +300,26 @@ export function LibraryRecordView({ record, onChanged, onDeleted, onReprocess, r
           </div>
         </div>
         <p className="text-[var(--color-ink-2)] text-xs">精修使用当前已选模型生成新记录，原记录保留。</p>
+        {!record.source.sourceLang && (
+          <p className="text-[var(--color-warn)] text-xs">
+            本记录尚未设置原文语言，请在「来源」中选择并保存后再翻译或精修。
+          </p>
+        )}
         {sourceEditing && (
           <fieldset disabled={busy} className="m-0 space-y-2 border-0 p-0">
+            <Select
+              label="记录原文语言"
+              value={sourceLang}
+              onChange={setSourceLang}
+              options={[
+                { value: '', label: '请选择原文语言', unavailableReason: '尚未设置' },
+                { value: 'en', label: '英语 → 中文' },
+                { value: 'zh', label: '中文 → 英语' },
+              ]}
+            />
+            <p className="text-[var(--color-ink-2)] text-xs">
+              更改原文语言后，已有译文需要重新翻译；原有译文和历史版本仍会保留。
+            </p>
             <input
               aria-label="来源名称"
               value={sourceLabel}
@@ -259,9 +338,9 @@ export function LibraryRecordView({ record, onChanged, onDeleted, onReprocess, r
             <div className="flex flex-wrap items-center gap-2">
               <Button
                 size="sm"
-                disabled={!sourceLabel.trim()}
+                disabled={!sourceLabel.trim() || !sourceLang}
                 onClick={() =>
-                  void mutate('source_update', { label: sourceLabel.trim(), url: sourceUrl.trim() || null })
+                  void mutate('source_update', { label: sourceLabel.trim(), url: sourceUrl.trim(), sourceLang })
                 }
               >
                 保存来源
@@ -289,7 +368,7 @@ export function LibraryRecordView({ record, onChanged, onDeleted, onReprocess, r
         )}
       </div>
 
-      {mediaPath && <LibraryMediaPlayer path={mediaPath} segments={segments} target={playback} />}
+      {mediaPath && <LibraryMediaPlayer recordId={record.id} path={mediaPath} segments={segments} target={playback} />}
 
       <nav aria-label="资料内容" className="flex gap-2 border-[var(--color-border-subtle)] border-b pb-3">
         {(
@@ -529,6 +608,8 @@ export function LibraryRecordView({ record, onChanged, onDeleted, onReprocess, r
                 focused={focused === entry.segment.id}
                 busy={busy}
                 media={Boolean(mediaPath)}
+                draft={drafts[entry.segment.id]}
+                onDraftChange={(update) => changeDraft(entry.segment.id, update)}
                 onSelect={(value) =>
                   setSelected((current) => {
                     const next = new Set(current)
@@ -592,6 +673,8 @@ function LibraryEntry({
   focused,
   busy,
   media,
+  draft,
+  onDraftChange,
   onSelect,
   onJump,
   onUpdate,
@@ -605,6 +688,8 @@ function LibraryEntry({
   focused: boolean
   busy: boolean
   media: boolean
+  draft?: EntryDraft
+  onDraftChange: (update: (current: EntryDraft) => EntryDraft) => void
   onSelect: (selected: boolean) => void
   onJump: (play: boolean) => void
   onUpdate: (patch: Record<string, unknown>) => Promise<boolean>
@@ -612,18 +697,40 @@ function LibraryEntry({
   onRetranslate: () => void
   onCopy: () => void
 }) {
-  const [editing, setEditing] = useState(false)
-  const [text, setText] = useState(entry.segment.text)
-  const [translation, setTranslation] = useState(entry.segment.translation ?? '')
-  const [editBase, setEditBase] = useState({
+  const editing = Boolean(draft?.textEdit)
+  const text = draft?.textEdit?.text ?? entry.segment.text
+  const translation = draft?.textEdit?.translation ?? entry.segment.translation ?? ''
+  const editBase = draft?.textEdit?.base ?? {
     revision: entry.segment.revision,
     text: entry.segment.text,
     translation: entry.segment.translation ?? '',
-  })
-  const [noteEditing, setNoteEditing] = useState(false)
-  const [note, setNote] = useState(entry.note)
-  const [noteBase, setNoteBase] = useState({ revision: entry.segment.revision, note: entry.note })
+  }
+  const noteEditing = Boolean(draft?.noteEdit)
+  const note = draft?.noteEdit?.note ?? entry.note
+  const noteBase = draft?.noteEdit?.base ?? { revision: entry.segment.revision, note: entry.note }
   const [history, setHistory] = useState(false)
+
+  function updateText(patch: Partial<NonNullable<EntryDraft['textEdit']>>) {
+    onDraftChange((current) => ({
+      ...current,
+      textEdit: { text, translation, base: editBase, ...current.textEdit, ...patch },
+    }))
+  }
+
+  function updateNote(patch: Partial<NonNullable<EntryDraft['noteEdit']>>) {
+    onDraftChange((current) => ({
+      ...current,
+      noteEdit: { note, base: noteBase, ...current.noteEdit, ...patch },
+    }))
+  }
+
+  function closeText() {
+    onDraftChange(({ textEdit: _, ...remaining }) => remaining)
+  }
+
+  function closeNote() {
+    onDraftChange(({ noteEdit: _, ...remaining }) => remaining)
+  }
 
   async function saveText() {
     if (entry.segment.revision !== editBase.revision) return
@@ -632,22 +739,24 @@ function LibraryEntry({
       ...(translation !== editBase.translation ? { translation } : {}),
     }
     if (Object.keys(patch).length === 0 || (await onUpdate({ ...patch, expectedRevision: editBase.revision })))
-      setEditing(false)
+      closeText()
   }
 
   function rebaseEdit() {
-    if (text === editBase.text) setText(entry.segment.text)
-    if (translation === editBase.translation) setTranslation(entry.segment.translation ?? '')
-    setEditBase({
-      revision: entry.segment.revision,
-      text: entry.segment.text,
-      translation: entry.segment.translation ?? '',
+    updateText({
+      text: text === editBase.text ? entry.segment.text : text,
+      translation: translation === editBase.translation ? (entry.segment.translation ?? '') : translation,
+      base: {
+        revision: entry.segment.revision,
+        text: entry.segment.text,
+        translation: entry.segment.translation ?? '',
+      },
     })
   }
 
   async function saveNote() {
     if (entry.segment.revision !== noteBase.revision) return
-    if (note === noteBase.note || (await onUpdate({ note, expectedRevision: noteBase.revision }))) setNoteEditing(false)
+    if (note === noteBase.note || (await onUpdate({ note, expectedRevision: noteBase.revision }))) closeNote()
   }
 
   return (
@@ -691,14 +800,7 @@ function LibraryEntry({
           size="sm"
           disabled={busy}
           onClick={() => {
-            setText(entry.segment.text)
-            setTranslation(entry.segment.translation ?? '')
-            setEditBase({
-              revision: entry.segment.revision,
-              text: entry.segment.text,
-              translation: entry.segment.translation ?? '',
-            })
-            setEditing((value) => !value)
+            if (!editing) updateText({})
           }}
         >
           修订
@@ -707,9 +809,7 @@ function LibraryEntry({
           size="sm"
           disabled={busy}
           onClick={() => {
-            setNote(entry.note)
-            setNoteBase({ revision: entry.segment.revision, note: entry.note })
-            setNoteEditing((value) => !value)
+            if (!noteEditing) updateNote({})
           }}
         >
           笔记
@@ -726,7 +826,7 @@ function LibraryEntry({
               aria-label={`修订第${index + 1}段原文`}
               rows={3}
               value={text}
-              onChange={(event) => setText(event.target.value)}
+              onChange={(event) => updateText({ text: event.target.value })}
               className={fieldClass}
             />
           </label>
@@ -736,7 +836,7 @@ function LibraryEntry({
               aria-label={`修订第${index + 1}段译文`}
               rows={3}
               value={translation}
-              onChange={(event) => setTranslation(event.target.value)}
+              onChange={(event) => updateText({ translation: event.target.value })}
               className={fieldClass}
             />
           </label>
@@ -765,7 +865,7 @@ function LibraryEntry({
             >
               保存修订
             </Button>
-            <Button size="sm" onClick={() => setEditing(false)}>
+            <Button size="sm" onClick={closeText}>
               取消修订
             </Button>
           </div>
@@ -798,8 +898,10 @@ function LibraryEntry({
                 size="sm"
                 disabled={busy}
                 onClick={() => {
-                  if (note === noteBase.note) setNote(entry.note)
-                  setNoteBase({ revision: entry.segment.revision, note: entry.note })
+                  updateNote({
+                    note: note === noteBase.note ? entry.note : note,
+                    base: { revision: entry.segment.revision, note: entry.note },
+                  })
                 }}
               >
                 保留笔记改动并载入最新版本
@@ -809,7 +911,7 @@ function LibraryEntry({
           <textarea
             aria-label={`第${index + 1}段笔记`}
             value={note}
-            onChange={(event) => setNote(event.target.value)}
+            onChange={(event) => updateNote({ note: event.target.value })}
             className={fieldClass}
             disabled={busy}
             rows={3}
@@ -822,7 +924,7 @@ function LibraryEntry({
             >
               保存笔记
             </Button>
-            <Button size="sm" disabled={busy} onClick={() => setNoteEditing(false)}>
+            <Button size="sm" disabled={busy} onClick={closeNote}>
               取消
             </Button>
           </div>

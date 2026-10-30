@@ -62,6 +62,7 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, String>
     let repo = state.repo();
     let result = match name {
         "library_list" => encode(repo.list(args.get("query").and_then(Value::as_str))?),
+        "library_browse" => encode(repo.browse(args.get("query").and_then(Value::as_str))?),
         "library_get" => encode(repo.get(string(args, "id")?)?),
         "library_rename" => {
             encode(repo.rename(string(args, "id")?, string(args, "title")?.to_owned())?)
@@ -70,6 +71,7 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, String>
             string(args, "id")?,
             string(args, "label")?.to_owned(),
             optional_string(args, "url")?,
+            optional_string(args, "sourceLang")?,
         )?),
         "library_delete" => {
             repo.delete(string(args, "id")?)?;

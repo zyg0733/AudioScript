@@ -1253,7 +1253,13 @@ pub fn retranslate_record(
     if selected.is_empty() || selected.len() > 50 {
         return Err("每次请选择 1 到 50 段重新翻译".into());
     }
-    let (config, tier) = retry_config(app, record.source.source_lang.as_deref());
+    let language = record
+        .source
+        .source_lang
+        .as_deref()
+        .filter(|language| matches!(*language, "en" | "zh"))
+        .ok_or("请先在记录来源中设置原文语言，再重新翻译")?;
+    let (config, tier) = retry_config(app, Some(language));
     let mut translator = create_translator(app, &config, tier)?.ok_or("请启用本地翻译引擎")?;
     translator.init(&config).map_err(|e| e.to_string())?;
     let mut errors = Vec::new();

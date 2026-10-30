@@ -2,6 +2,7 @@ import { act, useState } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { LibraryRecord } from '@/shared/types'
+import { clearDrafts } from './drafts'
 import { LibraryRecordView } from './LibraryRecordView'
 import { libraryRecord } from './test-fixtures'
 
@@ -70,6 +71,7 @@ describe('LibraryRecordView editing and evidence', () => {
 
   beforeEach(async () => {
     initial = libraryRecord()
+    clearDrafts(initial.id)
     mocks.libraryCall.mockReset().mockImplementation(async (action: string) => (action === 'terms_list' ? [] : initial))
     mocks.save.mockReset().mockResolvedValue('/tmp/excerpt.md')
     mocks.revealPath.mockReset().mockResolvedValue(undefined)
@@ -130,6 +132,114 @@ describe('LibraryRecordView editing and evidence', () => {
       expectedRevision: 3,
       text: 'Rust prevents races.',
     })
+  })
+
+  it('retains text and note drafts across pages, filters, tabs and leaving the record', async () => {
+    initial = {
+      ...initial,
+      segments: Array.from({ length: 101 }, (_, index) => ({
+        ...initial.segments[0],
+        segment: { ...initial.segments[0].segment, id: `draft-${index}`, text: `原文 ${index}` },
+      })),
+    }
+    await act(async () => root.render(<Harness key="draft-record" />))
+    await act(async () => button('修订').click())
+    await enter('修订第1段原文', '保留这份修订')
+    await act(async () => button('笔记').click())
+    await enter('第1段笔记', '保留这份笔记')
+    expect(container.textContent).toContain('1 段有未保存修改')
+    await act(async () => button('下一页').click())
+    expect(container.querySelector('[aria-label="修订第1段原文"]')).toBeNull()
+    await act(async () => button('继续修订').click())
+    expect(container.querySelector<HTMLTextAreaElement>('[aria-label="修订第1段原文"]')?.value).toBe('保留这份修订')
+    await enter('在当前记录中查找', '没有匹配的原文')
+    await enter('在当前记录中查找', '')
+    expect(container.querySelector<HTMLTextAreaElement>('[aria-label="第1段笔记"]')?.value).toBe('保留这份笔记')
+    await act(async () => button('章节与问答').click())
+    await act(async () => button('原文与摘录').click())
+    expect(container.querySelector<HTMLTextAreaElement>('[aria-label="修订第1段原文"]')?.value).toBe('保留这份修订')
+    await act(async () => root.render(null))
+    initial = {
+      ...initial,
+      revision: 5,
+      segments: initial.segments.map((entry) => ({ ...entry, segment: { ...entry.segment, revision: 3 } })),
+    }
+    await act(async () => root.render(<Harness />))
+    expect(container.querySelector<HTMLTextAreaElement>('[aria-label="第1段笔记"]')?.value).toBe('保留这份笔记')
+    expect(button('保存修订').disabled).toBe(true)
+    expect(button('保存笔记').disabled).toBe(true)
+    await act(async () => button('取消修订').click())
+    const first = container.querySelector('#library-segment-draft-0')
+    if (!first) throw new Error('草稿片段未找到')
+    await act(async () => button('取消', first).click())
+    expect(container.textContent).not.toContain('段有未保存修改')
+  })
+
+  it('requires an explicit language for older records before translation or refinement', async () => {
+    const older = { ...initial, source: { ...initial.source, sourceLang: undefined } }
+    await act(async () => publishRecord(older))
+    expect(button('译文另存精修版').disabled).toBe(true)
+    await act(async () => button('重新翻译全部').click())
+    expect(mocks.libraryCall).not.toHaveBeenCalledWith('retranslate', expect.anything())
+    expect(container.querySelector('[aria-label="记录原文语言"]')).not.toBeNull()
+    const language = container.querySelector<HTMLSelectElement>('[aria-label="记录原文语言"]')
+    if (!language) throw new Error('语言设置未找到')
+    await act(async () => {
+      language.value = 'zh'
+      language.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+    mocks.libraryCall.mockResolvedValueOnce({ ...older, source: { ...older.source, sourceLang: 'zh' } })
+    await act(async () => button('保存来源').click())
+    expect(mocks.libraryCall).toHaveBeenCalledWith('source_update', {
+      id: initial.id,
+      label: initial.source.label,
+      url: '',
+      sourceLang: 'zh',
+    })
+    expect(button('译文另存精修版').disabled).toBe(false)
+  })
+
+  it('clears an existing source link by sending an empty URL', async () => {
+    await act(async () =>
+      publishRecord({ ...initial, source: { ...initial.source, url: 'https://example.com/course' } }),
+    )
+    await act(async () => button('来源').click())
+    await enter('来源链接', '')
+    await act(async () => button('保存来源').click())
+    expect(mocks.libraryCall).toHaveBeenCalledWith('source_update', {
+      id: initial.id,
+      label: initial.source.label,
+      url: '',
+      sourceLang: 'en',
+    })
+  })
+
+  it('locates a search match beyond the first page and allows repeating the same match', async () => {
+    const record = {
+      ...initial,
+      segments: Array.from({ length: 205 }, (_, index) => ({
+        ...initial.segments[0],
+        segment: { ...initial.segments[0].segment, id: `match-${index}` },
+      })),
+    }
+    const renderMatch = (focusSequence: number) =>
+      root.render(
+        <LibraryRecordView
+          record={record}
+          onChanged={mocks.changed}
+          onDeleted={mocks.deleted}
+          onReprocess={mocks.reprocess}
+          reprocessing={false}
+          initialSegmentId="match-204"
+          focusSequence={focusSequence}
+        />,
+      )
+    await act(async () => renderMatch(1))
+    expect(container.querySelector<HTMLSelectElement>('[aria-label="片段页码"]')?.value).toBe('3')
+    expect(container.querySelector('#library-segment-match-204')?.className).toContain('border-[var(--color-accent)]')
+    await act(async () => button('上一页').click())
+    await act(async () => renderMatch(2))
+    expect(container.querySelector<HTMLSelectElement>('[aria-label="片段页码"]')?.value).toBe('3')
   })
 
   it('exports selected segment IDs with the requested format and pinned bookmark versions', async () => {

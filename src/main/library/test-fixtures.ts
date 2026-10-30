@@ -8,7 +8,12 @@ export function libraryRecord(id = 'record-1'): LibraryRecord {
     title: '内存管理课程',
     createdAt: 1_700_000_000_000,
     updatedAt: 1_700_000_001_000,
-    source: { kind: 'subtitle' as LibraryRecord['source']['kind'], label: '课程字幕', durationMs: 14000 },
+    source: {
+      kind: 'subtitle' as LibraryRecord['source']['kind'],
+      label: '课程字幕',
+      durationMs: 14000,
+      sourceLang: 'en',
+    },
     segments: ['first', 'second'].map((name, index) => ({
       segment: {
         id: name,

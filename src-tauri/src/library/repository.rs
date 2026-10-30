@@ -100,6 +100,28 @@ fn nonempty(value: String, name: &str) -> Result<String, String> {
     }
 }
 
+fn search_excerpt(text: &str, query: &str) -> Option<String> {
+    let offset = text.to_lowercase().find(query)?;
+    let chars: Vec<char> = text.chars().collect();
+    let mut folded_bytes = 0;
+    let matched = chars
+        .iter()
+        .position(|c| {
+            folded_bytes += c.to_lowercase().map(char::len_utf8).sum::<usize>();
+            folded_bytes > offset
+        })
+        .unwrap_or(0);
+    let start = matched.saturating_sub(35);
+    let end = (matched + 125).min(chars.len());
+    let snippet: String = chars[start..end].iter().collect();
+    Some(format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        snippet,
+        if end < chars.len() { "…" } else { "" }
+    ))
+}
+
 fn version(segment: &LibrarySegment, origin: VersionOrigin, timestamp: u64) -> SegmentVersion {
     SegmentVersion {
         revision: segment.segment.revision,
@@ -262,12 +284,18 @@ impl Repository {
     }
 
     pub fn list(&self, query: Option<&str>) -> Result<Vec<LibrarySummary>, String> {
+        Ok(self.browse(query)?.records)
+    }
+
+    pub fn browse(&self, query: Option<&str>) -> Result<LibraryListing, String> {
         let _guard = self
             .access
             .lock()
             .map_err(|_| "资料仓库暂不可用，请重启应用")?;
         let query = query.unwrap_or("").trim().to_lowercase();
         let mut records = Vec::new();
+        let mut hits = Vec::new();
+        let mut issues = Vec::new();
         for entry in
             fs::read_dir(self.root.join("records")).map_err(|e| format!("读取资料列表失败：{e}"))?
         {
@@ -280,21 +308,46 @@ impl Repository {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .ok_or("记录文件名无效")?;
-            let record = self.read_record(id)?;
+            let record = match self.read_record(id) {
+                Ok(record) => record,
+                Err(error) => {
+                    issues.push(LibraryReadIssue {
+                        id: id.into(),
+                        error,
+                    });
+                    continue;
+                }
+            };
+            let mut record_hits = Vec::new();
+            if !query.is_empty() {
+                for entry in &record.segments {
+                    let candidates = [
+                        ("原文", entry.segment.text.as_str()),
+                        ("译文", entry.segment.translation.as_deref().unwrap_or("")),
+                        ("笔记", entry.note.as_str()),
+                    ];
+                    if let Some((field, excerpt)) = candidates.iter().find_map(|(field, text)| {
+                        search_excerpt(text, &query).map(|excerpt| (*field, excerpt))
+                    }) {
+                        record_hits.push(LibrarySearchHit {
+                            record_id: record.id.clone(),
+                            segment_id: entry.segment.id.clone(),
+                            start_ms: entry.segment.start_ms,
+                            field: field.into(),
+                            excerpt,
+                        });
+                        if record_hits.len() == 3 {
+                            break;
+                        }
+                    }
+                }
+            }
             let matches = query.is_empty()
                 || record.title.to_lowercase().contains(&query)
                 || record.source.label.to_lowercase().contains(&query)
-                || record.segments.iter().any(|s| {
-                    s.segment.text.to_lowercase().contains(&query)
-                        || s.segment
-                            .translation
-                            .as_deref()
-                            .unwrap_or("")
-                            .to_lowercase()
-                            .contains(&query)
-                        || s.note.to_lowercase().contains(&query)
-                });
+                || !record_hits.is_empty();
             if matches {
+                hits.extend(record_hits);
                 records.push(LibrarySummary::from(record));
             }
         }
@@ -303,7 +356,12 @@ impl Repository {
                 .cmp(&a.updated_at)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        Ok(records)
+        issues.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(LibraryListing {
+            records,
+            hits,
+            issues,
+        })
     }
 
     pub fn create_record(
@@ -374,12 +432,39 @@ impl Repository {
         id: &str,
         label: String,
         url: Option<String>,
+        source_lang: Option<String>,
     ) -> Result<LibraryRecord, String> {
         let label = nonempty(label, "来源名称")?;
+        if source_lang
+            .as_deref()
+            .is_some_and(|language| !matches!(language, "en" | "zh"))
+        {
+            return Err("原文语言仅支持英语或中文".into());
+        }
         self.update(id, |record| {
             record.source.label = label;
             if let Some(url) = url {
                 record.source.url = (!url.trim().is_empty()).then(|| url.trim().to_owned());
+            }
+            if let Some(language) = source_lang {
+                if record.source.source_lang.as_deref() != Some(language.as_str()) {
+                    let timestamp = now_ms();
+                    for entry in &mut record.segments {
+                        entry.source_revision = entry.source_revision.saturating_add(1);
+                        entry.segment.revision = entry.segment.revision.saturating_add(1);
+                        if entry.segment.translation.is_some()
+                            || entry.segment.translation_state == TranslationState::Pending
+                        {
+                            entry.segment.translation_state = TranslationState::Failed;
+                            entry.segment.translation_error =
+                                Some("原文语言已更改，请重新翻译；现有译文已保留供核对。".into());
+                        }
+                        entry
+                            .versions
+                            .push(version(entry, VersionOrigin::User, timestamp));
+                    }
+                }
+                record.source.source_lang = Some(language);
             }
             Ok(())
         })
@@ -417,6 +502,9 @@ impl Repository {
         }
         if record.source.id.is_some() && record.source.id != source.id {
             return Err("会话来源已变化，未覆盖原记录".into());
+        }
+        if record.source.source_lang.is_some() && record.source.source_lang != source.source_lang {
+            return Err("记录的原文语言已改变，请将当前转写另存为新记录".into());
         }
         let mut changed = false;
         for incoming in segments.into_iter().filter(|s| s.is_persistable()) {

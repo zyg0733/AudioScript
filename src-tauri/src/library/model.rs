@@ -109,6 +109,35 @@ pub struct LibrarySummary {
     pub bookmark_count: u32,
 }
 
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibrarySearchHit {
+    pub record_id: String,
+    pub segment_id: String,
+    #[typeshare(serialized_as = "number")]
+    pub start_ms: u64,
+    pub field: String,
+    pub excerpt: String,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryReadIssue {
+    pub id: String,
+    pub error: String,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryListing {
+    pub records: Vec<LibrarySummary>,
+    pub hits: Vec<LibrarySearchHit>,
+    pub issues: Vec<LibraryReadIssue>,
+}
+
 impl From<LibraryRecord> for LibrarySummary {
     fn from(record: LibraryRecord) -> Self {
         Self {
