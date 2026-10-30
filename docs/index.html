@@ -1857,7 +1857,7 @@
             <article class="feature" data-reveal style="--d: 60ms">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" aria-hidden="true"><path d="M4 5h16v11H4zM8 20h8M12 16v4M7 9h10M7 12h6" /></svg>
               <h3><span class="zh" lang="zh-CN">流式双语字幕。</span><span class="en" lang="en">Streaming bilingual subtitles.</span></h3>
-              <p><span class="zh" lang="zh-CN">partial 实时刷新，句末定稿；原文在上，译文在下。英语 ↔ 中文，逐句本地翻译。</span><span class="en" lang="en">Partials update live and freeze at sentence end. Source above, translation below. English ↔ Chinese, translated sentence by sentence.</span></p>
+              <p><span class="zh" lang="zh-CN">流式模型实时刷新并在句末定稿；原文在上，译文在下。可选多语言模型扩展翻译方向。</span><span class="en" lang="en">Streaming models update partials and finalize at sentence end. Source above, translation below; optional multilingual models support more language pairs.</span></p>
               <span class="mono">STREAM · EN ↔ ZH</span>
             </article>
             <article class="feature" data-reveal>
@@ -1965,10 +1965,34 @@
                 <span class="lic">Apache-2.0 · <span class="zh" lang="zh-CN">按需下载</span><span class="en" lang="en">optional</span></span>
               </div>
               <div class="model-row">
+                <h3>X-ASR</h3><span class="size">128 MB / 161 MB</span>
+                <p><span class="zh" lang="zh-CN">中英流式识别；下载 / 安装体积。</span><span class="en" lang="en">Streaming English and Chinese recognition; download / installed size.</span></p><span class="lic">Apache-2.0 · optional</span>
+              </div>
+              <div class="model-row">
+                <h3>Nemotron 3.5</h3><span class="size">453 MB / 651 MB</span>
+                <p><span class="zh" lang="zh-CN">28 种语言的流式识别；下载 / 安装体积。</span><span class="en" lang="en">Streaming recognition in 28 languages; download / installed size.</span></p><span class="lic">OpenMDW-1.1 · optional</span>
+              </div>
+              <div class="model-row">
+                <h3>Qwen3-ASR</h3><span class="size">838 MB / 972 MB</span>
+                <p><span class="zh" lang="zh-CN">30 种语言的非流式识别；下载 / 安装体积。</span><span class="en" lang="en">Non-streaming recognition in 30 languages; download / installed size.</span></p><span class="lic">Apache-2.0 / MIT · optional</span>
+              </div>
+              <div class="model-row">
                 <h3><span class="zh" lang="zh-CN">内置机器翻译</span><span class="en" lang="en">Bundled translation</span></h3>
                 <span class="size">≈164 MB</span>
                 <p><span class="zh" lang="zh-CN">en → zh 与 zh → en 双向轻量模型，延迟低，随应用分发。</span><span class="en" lang="en">Lightweight en → zh and zh → en models with low latency, shipped with the app.</span></p>
                 <span class="lic">Apache-2.0 / CC-BY-4.0</span>
+              </div>
+              <div class="model-row">
+                <h3>NLLB-200</h3><span class="size">558 MB / 616 MB</span>
+                <p><span class="zh" lang="zh-CN">30 种语言的可选翻译模型；仅限非商业用途。</span><span class="en" lang="en">Optional translation model for 30 languages; non-commercial use only.</span></p><span class="lic">CC-BY-NC-4.0 · optional</span>
+              </div>
+              <div class="model-row">
+                <h3>LMT-60 Fast</h3><span class="size">513 MB / 585 MB</span>
+                <p><span class="zh" lang="zh-CN">29 种语言，中英方向优先；下载 / 安装体积。</span><span class="en" lang="en">29 languages, prioritizing English and Chinese; download / installed size.</span></p><span class="lic">Apache-2.0 · optional</span>
+              </div>
+              <div class="model-row">
+                <h3>LMT-60 High</h3><span class="size">1.43 GB / 1.62 GB</span>
+                <p><span class="zh" lang="zh-CN">29 种语言的高精度版本；下载 / 安装体积。</span><span class="en" lang="en">Higher-accuracy model for 29 languages; download / installed size.</span></p><span class="lic">Apache-2.0 · optional</span>
               </div>
             </div>
           </div>
@@ -1982,7 +2006,7 @@
             <h2 id="download-title"><span class="zh" lang="zh-CN">把它放到你的桌面上。</span><span class="en" lang="en">Put it on your desktop.</span></h2>
             <p class="section-lede"><span class="zh" lang="zh-CN">安装包内含内置模型，首次启动无需联网。</span><span class="en" lang="en">The installer includes the bundled models. First launch needs no network.</span></p>
           </header>
-          <p class="release mono"><span data-version>Fork Releases</span><i>·</i><span data-date>—</span><i>·</i><a href="https://github.com/zyg0733/AudioScript/releases/latest" target="_blank" rel="noopener noreferrer"><span class="zh" lang="zh-CN">全部版本</span><span class="en" lang="en">All releases</span></a></p>
+          <p class="release mono"><span data-version>v0.6.0</span><i>·</i><span data-date data-iso="2026-10-31">2026-10-31</span><i>·</i><a href="https://github.com/zyg0733/AudioScript/releases/latest" target="_blank" rel="noopener noreferrer"><span class="zh" lang="zh-CN">全部版本</span><span class="en" lang="en">All releases</span></a></p>
 
           <div class="download-grid">
             <article class="download" data-os="mac" data-reveal>
@@ -2027,7 +2051,7 @@
             </details>
             <details name="faq">
               <summary><span class="zh" lang="zh-CN">支持哪些语言？</span><span class="en" lang="en">Which languages are supported?</span></summary>
-              <p><span class="zh" lang="zh-CN">英语 ↔ 中文，需要手动选择翻译方向；不支持自动语言检测。</span><span class="en" lang="en">English ↔ Chinese. You choose the direction; there is no automatic language detection.</span></p>
+              <p><span class="zh" lang="zh-CN">内置模型支持英语与中文。可选的多语言识别和翻译模型支持更多语言，具体方向取决于所选模型；请手动选择语言。</span><span class="en" lang="en">The bundled models support English and Chinese. Optional multilingual models support more languages; available pairs depend on the selected models. Choose the languages manually.</span></p>
             </details>
             <details name="faq">
               <summary><span class="zh" lang="zh-CN">需要安装 BlackHole 之类的虚拟声卡吗？</span><span class="en" lang="en">Do I need BlackHole or another virtual audio driver?</span></summary>
