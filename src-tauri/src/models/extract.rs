@@ -5,11 +5,53 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::catalog::{ArchiveFormat, CatalogEntry};
 use super::{ModelError, IO_CHUNK};
+use crate::i18n::{tf, Key};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneProfile {
+    Off,
+    MixedInt8,
+    AllInt8,
+}
+
+impl PruneProfile {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "sherpa-asr-mixed-int8" => Some(Self::MixedInt8),
+            "sherpa-asr-all-int8" => Some(Self::AllInt8),
+            _ => None,
+        }
+    }
+
+    fn from_catalog(value: Option<&str>) -> Self {
+        value.and_then(Self::parse).unwrap_or(Self::Off)
+    }
+
+    fn keeps(self, name: &str) -> bool {
+        if matches!(name, "tokens.txt" | "bpe.model") {
+            return true;
+        }
+        if !name.ends_with(".onnx") {
+            return false;
+        }
+        let int8 = name.contains(".int8.");
+        let role = ["encoder", "decoder", "joiner"]
+            .into_iter()
+            .find(|prefix| name.starts_with(*prefix));
+        match (self, role) {
+            (Self::MixedInt8, Some("encoder" | "joiner")) => int8,
+            (Self::MixedInt8, Some("decoder")) => !int8,
+            (Self::AllInt8, Some(_)) => int8,
+            _ => false,
+        }
+    }
+}
 
 pub struct ExtractSpec<'a> {
     pub format: ArchiveFormat,
     pub roots: Vec<&'a str>,
-    pub prune_asr: bool,
+    pub prune: PruneProfile,
+    pub allowed: Vec<&'a str>,
     pub max_bytes: u64,
 }
 
@@ -18,11 +60,19 @@ impl<'a> ExtractSpec<'a> {
         let archive = entry
             .archive
             .as_ref()
-            .ok_or_else(|| ModelError::Internal(format!("{} 没有归档信息", entry.id)))?;
+            .ok_or_else(|| ModelError::Internal(tf(Key::ModelNoArchiveInfo, &[&entry.id])))?;
+        let mut allowed = Vec::new();
+        if let Some(asr) = &entry.required.asr {
+            allowed.extend(asr.files.iter().map(String::as_str));
+        }
+        if let Some(mt) = &entry.required.mt {
+            allowed.extend(mt.files.iter().map(String::as_str));
+        }
         Ok(Self {
             format: archive.format,
             roots: entry.archive_roots(),
-            prune_asr: entry.prune_profile.as_deref() == Some("sherpa-asr-mixed-int8"),
+            prune: PruneProfile::from_catalog(entry.prune_profile.as_deref()),
+            allowed,
             max_bytes: archive.max_extracted_bytes,
         })
     }
@@ -40,22 +90,6 @@ fn safe_rel_path(name: &str) -> Option<PathBuf> {
         out.push(part);
     }
     (!out.as_os_str().is_empty()).then_some(out)
-}
-
-fn keep_asr_file(name: &str) -> bool {
-    if matches!(name, "tokens.txt" | "bpe.model") {
-        return true;
-    }
-    if !name.ends_with(".onnx") {
-        return false;
-    }
-    if name.starts_with("encoder") || name.starts_with("joiner") {
-        return name.contains(".int8.");
-    }
-    if name.starts_with("decoder") {
-        return !name.contains(".int8.");
-    }
-    false
 }
 
 fn strip_root<'a>(rel: &'a Path, roots: &[&str]) -> Option<&'a Path> {
@@ -86,7 +120,10 @@ pub fn extract_archive(
     let mut total = 0u64;
     let mut buffer = [0u8; IO_CHUNK];
 
-    for entry in tar.entries().map_err(|e| ModelError::Extract(e.to_string()))? {
+    for entry in tar
+        .entries()
+        .map_err(|e| ModelError::Extract(e.to_string()))?
+    {
         if cancel.load(Ordering::SeqCst) {
             return Err(ModelError::Cancelled);
         }
@@ -95,8 +132,9 @@ pub fn extract_archive(
         let header = entry.header();
         let entry_type = header.entry_type();
         if !entry_type.is_file() && !entry_type.is_dir() {
-            return Err(ModelError::UnsafeArchive(format!(
-                "不支持的归档条目类型：{entry_type:?}"
+            return Err(ModelError::UnsafeArchive(tf(
+                Key::ModelUnsupportedEntry,
+                &[&format!("{entry_type:?}")],
             )));
         }
         if entry_type.is_dir() {
@@ -109,27 +147,40 @@ pub fn extract_archive(
             .to_string_lossy()
             .into_owned();
         let Some(rel) = safe_rel_path(&path) else {
-            return Err(ModelError::UnsafeArchive(format!("不安全的路径：{path}")));
+            return Err(ModelError::UnsafeArchive(tf(
+                Key::ModelUnsafePath,
+                &[&path],
+            )));
         };
         let Some(rel) = strip_root(&rel, &spec.roots) else {
             continue;
         };
         let components: Vec<_> = rel.components().collect();
-        if components.len() != 1 {
-            continue;
-        }
-        let Some(name) = components[0].as_os_str().to_str() else {
-            continue;
-        };
-        if spec.prune_asr && !keep_asr_file(name) {
+        let top_level = components.len() == 1;
+        if spec.prune != PruneProfile::Off {
+            if !top_level {
+                continue;
+            }
+            let Some(name) = components[0].as_os_str().to_str() else {
+                continue;
+            };
+            if !spec.prune.keeps(name) {
+                continue;
+            }
+        } else if !top_level
+            && !spec
+                .allowed
+                .iter()
+                .any(|allowed| Path::new(*allowed) == rel)
+        {
             continue;
         }
 
         total = total.saturating_add(entry.size());
         if spec.max_bytes > 0 && total > spec.max_bytes {
-            return Err(ModelError::UnsafeArchive(format!(
-                "解压后体积超过上限（{} 字节）",
-                spec.max_bytes
+            return Err(ModelError::UnsafeArchive(tf(
+                Key::ModelTooLarge,
+                &[&spec.max_bytes.to_string()],
             )));
         }
 
@@ -168,16 +219,23 @@ mod tests {
             header.set_size(data.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            builder.append_data(&mut header, name, Cursor::new(data)).unwrap();
+            builder
+                .append_data(&mut header, name, Cursor::new(data))
+                .unwrap();
         }
         builder.into_inner().unwrap().finish().unwrap()
     }
 
-    fn spec<'a>(format: ArchiveFormat, roots: Vec<&'a str>, prune: bool) -> ExtractSpec<'a> {
+    fn spec<'a>(
+        format: ArchiveFormat,
+        roots: Vec<&'a str>,
+        prune: PruneProfile,
+    ) -> ExtractSpec<'a> {
         ExtractSpec {
             format,
             roots,
-            prune_asr: prune,
+            prune,
+            allowed: Vec::new(),
             max_bytes: 10 * 1024 * 1024,
         }
     }
@@ -198,14 +256,22 @@ mod tests {
 
     #[test]
     fn asr_prune_keeps_only_the_expected_files() {
-        assert!(keep_asr_file("encoder-x.int8.onnx"));
-        assert!(!keep_asr_file("encoder-x.onnx"));
-        assert!(keep_asr_file("decoder-x.onnx"));
-        assert!(!keep_asr_file("decoder-x.int8.onnx"));
-        assert!(keep_asr_file("joiner-x.int8.onnx"));
-        assert!(keep_asr_file("tokens.txt"));
-        assert!(keep_asr_file("bpe.model"));
-        assert!(!keep_asr_file("test_wavs/a.wav"));
+        let mixed = PruneProfile::MixedInt8;
+        assert!(mixed.keeps("encoder-x.int8.onnx"));
+        assert!(!mixed.keeps("encoder-x.onnx"));
+        assert!(mixed.keeps("decoder-x.onnx"));
+        assert!(!mixed.keeps("decoder-x.int8.onnx"));
+        assert!(mixed.keeps("joiner-x.int8.onnx"));
+        assert!(mixed.keeps("tokens.txt"));
+        assert!(mixed.keeps("bpe.model"));
+        assert!(!mixed.keeps("test_wavs/a.wav"));
+
+        let all = PruneProfile::AllInt8;
+        assert!(all.keeps("encoder-x.int8.onnx"));
+        assert!(all.keeps("decoder-x.int8.onnx"));
+        assert!(all.keeps("joiner-x.int8.onnx"));
+        assert!(!all.keeps("decoder-x.onnx"));
+        assert!(all.keeps("tokens.txt"));
     }
 
     #[test]
@@ -226,12 +292,47 @@ mod tests {
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let cancel = AtomicBool::new(false);
-        let s = spec(ArchiveFormat::TarGz, vec!["root"], true);
+        let s = spec(ArchiveFormat::TarGz, vec!["root"], PruneProfile::MixedInt8);
         extract_archive(&archive, &s, &out, &cancel).unwrap();
 
         assert!(out.join("encoder-x.int8.onnx").is_file());
         assert!(out.join("tokens.txt").is_file());
         assert!(!out.join("64").exists());
+        assert!(!out.join("test_wavs").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extracts_nested_required_files() {
+        let bytes = tar_gz(&[
+            ("root/conv_frontend.onnx", b"conv"),
+            ("root/encoder.int8.onnx", b"enc"),
+            ("root/decoder.int8.onnx", b"dec"),
+            ("root/tokenizer/merges.txt", b"merges"),
+            ("root/tokenizer/tokenizer_config.json", b"config"),
+            ("root/tokenizer/vocab.json", b"vocab"),
+            ("root/test_wavs/a.wav", b"wav"),
+        ]);
+        let dir = std::env::temp_dir().join(format!("extract-nested-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("a.tar.gz");
+        std::fs::write(&archive, &bytes).unwrap();
+
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut s = spec(ArchiveFormat::TarGz, vec!["root"], PruneProfile::Off);
+        s.allowed = vec![
+            "tokenizer/merges.txt",
+            "tokenizer/tokenizer_config.json",
+            "tokenizer/vocab.json",
+        ];
+        extract_archive(&archive, &s, &out, &cancel).unwrap();
+
+        assert!(out.join("conv_frontend.onnx").is_file());
+        assert!(out.join("tokenizer/merges.txt").is_file());
+        assert!(out.join("tokenizer/tokenizer_config.json").is_file());
+        assert!(out.join("tokenizer/vocab.json").is_file());
         assert!(!out.join("test_wavs").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -258,7 +359,7 @@ mod tests {
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let cancel = AtomicBool::new(false);
-        let s = spec(ArchiveFormat::TarBz2, vec!["root"], false);
+        let s = spec(ArchiveFormat::TarBz2, vec!["root"], PruneProfile::Off);
         extract_archive(&archive, &s, &out, &cancel).unwrap();
         assert_eq!(std::fs::read(out.join("model.bin")).unwrap(), b"abc");
         std::fs::remove_dir_all(&dir).ok();
@@ -274,7 +375,7 @@ mod tests {
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let cancel = AtomicBool::new(false);
-        let s = spec(ArchiveFormat::TarGz, vec!["root"], false);
+        let s = spec(ArchiveFormat::TarGz, vec!["root"], PruneProfile::Off);
         extract_archive(&archive, &s, &out, &cancel).unwrap();
         assert!(out.join("keep.txt").is_file());
         assert!(!out.join("x.txt").exists());
@@ -291,7 +392,7 @@ mod tests {
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let cancel = AtomicBool::new(false);
-        let mut s = spec(ArchiveFormat::TarGz, vec!["root"], false);
+        let mut s = spec(ArchiveFormat::TarGz, vec!["root"], PruneProfile::Off);
         s.max_bytes = 1024;
         let e = extract_archive(&archive, &s, &out, &cancel).unwrap_err();
         assert!(matches!(e, ModelError::UnsafeArchive(_)), "{e}");

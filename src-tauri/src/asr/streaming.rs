@@ -5,6 +5,8 @@ use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineStream};
 use super::segment::SegmentBuilder;
 use super::{AsrEngine, AsrError, EngineCaps, TARGET_SAMPLE_RATE};
 use crate::config::AsrConfig;
+use crate::i18n::{tf, tr, Key};
+use crate::models::catalog::CatalogEntry;
 use crate::transcript::TranscriptSegment;
 
 const TAIL_SILENCE_SECONDS: f32 = 0.3;
@@ -24,6 +26,14 @@ enum Precision {
 }
 
 impl Precision {
+    fn parse(value: Option<&str>) -> Option<Self> {
+        match value {
+            Some("int8") => Some(Self::Int8),
+            Some("fp32") => Some(Self::Fp32),
+            _ => None,
+        }
+    }
+
     fn matches(self, name: &str) -> bool {
         match self {
             Precision::Int8 => name.contains(".int8."),
@@ -32,9 +42,21 @@ impl Precision {
     }
 }
 
-pub fn discover_model_files(dir: &Path) -> Result<ModelFiles, AsrError> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| AsrError::ModelLoad(format!("无法读取模型目录 {}：{e}", dir.display())))?;
+fn discover_model_files(dir: &Path, entry: &CatalogEntry) -> Result<ModelFiles, AsrError> {
+    let asr = entry.required.asr.as_ref();
+    let encoder_pref =
+        Precision::parse(asr.and_then(|a| a.encoder.as_deref())).unwrap_or(Precision::Int8);
+    let decoder_pref =
+        Precision::parse(asr.and_then(|a| a.decoder.as_deref())).unwrap_or(Precision::Fp32);
+    let joiner_pref =
+        Precision::parse(asr.and_then(|a| a.joiner.as_deref())).unwrap_or(Precision::Int8);
+
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        AsrError::ModelLoad(tf(
+            Key::AsrReadModelDirFailed,
+            &[&dir.display().to_string(), &e.to_string()],
+        ))
+    })?;
 
     let names: Vec<String> = entries
         .filter_map(|e| e.ok())
@@ -53,15 +75,17 @@ pub fn discover_model_files(dir: &Path) -> Result<ModelFiles, AsrError> {
             .find(|n| prefer.matches(n))
             .or_else(|| candidates.first())
             .ok_or_else(|| {
-                AsrError::MissingModelFile(format!(
-                    "{}/{}*.onnx\n目录实际内容：{}",
-                    dir.display(),
-                    prefix,
-                    if names.is_empty() {
-                        "(空)".to_string()
-                    } else {
-                        names.join(", ")
-                    }
+                AsrError::MissingModelFile(tf(
+                    Key::AsrMissingPattern,
+                    &[
+                        &dir.display().to_string(),
+                        prefix,
+                        &if names.is_empty() {
+                            tr(Key::AsrEmptyFolder).to_string()
+                        } else {
+                            names.join(", ")
+                        },
+                    ],
                 ))
             })?;
 
@@ -70,22 +94,22 @@ pub fn discover_model_files(dir: &Path) -> Result<ModelFiles, AsrError> {
 
     let tokens = dir.join("tokens.txt");
     if !tokens.is_file() {
-        return Err(AsrError::MissingModelFile(format!(
-            "{}\n目录实际内容：{}",
-            tokens.display(),
-            names.join(", ")
+        return Err(AsrError::MissingModelFile(tf(
+            Key::AsrMissingFile,
+            &[&tokens.display().to_string(), &names.join(", ")],
         )));
     }
 
     Ok(ModelFiles {
-        encoder: pick("encoder", Precision::Int8)?,
-        decoder: pick("decoder", Precision::Fp32)?,
-        joiner: pick("joiner", Precision::Int8)?,
+        encoder: pick("encoder", encoder_pref)?,
+        decoder: pick("decoder", decoder_pref)?,
+        joiner: pick("joiner", joiner_pref)?,
         tokens,
     })
 }
 
 pub struct StreamingAdapter {
+    entry: &'static CatalogEntry,
     recognizer: Option<OnlineRecognizer>,
     stream: Option<OnlineStream>,
     utterance: UtteranceState,
@@ -139,15 +163,10 @@ impl UtteranceState {
     }
 }
 
-impl Default for StreamingAdapter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl StreamingAdapter {
-    pub fn new() -> Self {
+    pub fn new(entry: &'static CatalogEntry) -> Self {
         Self {
+            entry,
             recognizer: None,
             stream: None,
             utterance: UtteranceState::default(),
@@ -206,8 +225,8 @@ impl AsrEngine for StreamingAdapter {
         let dir = cfg
             .model_dir
             .as_ref()
-            .ok_or_else(|| AsrError::InvalidConfig("model_dir 未设置".into()))?;
-        let files = discover_model_files(Path::new(dir))?;
+            .ok_or_else(|| AsrError::InvalidConfig(tr(Key::AsrModelDirNotSet).into()))?;
+        let files = discover_model_files(Path::new(dir), self.entry)?;
 
         let mut config = OnlineRecognizerConfig::default();
 
@@ -226,13 +245,22 @@ impl AsrEngine for StreamingAdapter {
         config.rule3_min_utterance_length = rule3;
 
         let recognizer = OnlineRecognizer::create(&config).ok_or_else(|| {
-            AsrError::ModelLoad(format!(
-                "OnlineRecognizer::create 返回 None（模型目录 {}）",
-                Path::new(dir).display()
+            AsrError::ModelLoad(tf(
+                Key::AsrRecognizerNone,
+                &[&Path::new(dir).display().to_string()],
             ))
         })?;
 
         let stream = recognizer.create_stream();
+        if self
+            .entry
+            .required
+            .asr
+            .as_ref()
+            .is_some_and(|asr| asr.stream_language)
+        {
+            stream.set_option("language", crate::config::base_lang(&cfg.source_lang));
+        }
 
         self.recognizer = Some(recognizer);
         self.stream = Some(stream);
@@ -445,7 +473,7 @@ mod tests {
 
     #[test]
     fn feed_after_flush_is_rejected_before_calling_the_native_stream() {
-        let mut adapter = StreamingAdapter::new();
+        let mut adapter = StreamingAdapter::new(builtin());
         adapter.flushed = true;
         assert!(matches!(
             adapter.feed_pcm(&[0.0; 1600]),
@@ -453,9 +481,15 @@ mod tests {
         ));
     }
 
+    use crate::config::AsrModelTier;
+
+    fn builtin() -> &'static CatalogEntry {
+        crate::models::catalog::asr_entry(AsrModelTier::Builtin)
+    }
+
     #[test]
     fn discover_reports_missing_dir_clearly() {
-        let err = discover_model_files(Path::new("/nonexistent/model/dir")).unwrap_err();
+        let err = discover_model_files(Path::new("/nonexistent/model/dir"), builtin()).unwrap_err();
         assert!(matches!(err, AsrError::ModelLoad(_)));
     }
 
@@ -480,7 +514,7 @@ mod tests {
             "tokens.txt",
         ]);
 
-        let f = discover_model_files(&dir).unwrap();
+        let f = discover_model_files(&dir, builtin()).unwrap();
         assert!(
             f.encoder.to_string_lossy().contains(".int8."),
             "encoder 应用 int8"
@@ -498,6 +532,34 @@ mod tests {
     }
 
     #[test]
+    fn discover_follows_the_catalog_precision_declaration() {
+        let dir = temp_model_dir(&[
+            "encoder-x.onnx",
+            "encoder-x.int8.onnx",
+            "decoder-x.onnx",
+            "decoder-x.int8.onnx",
+            "joiner-x.onnx",
+            "joiner-x.int8.onnx",
+            "tokens.txt",
+        ]);
+        let nemotron = crate::models::catalog::asr_entry(AsrModelTier::Nemotron);
+        let f = discover_model_files(&dir, nemotron).unwrap();
+        assert!(
+            f.encoder.to_string_lossy().contains(".int8."),
+            "Nemotron 的 encoder 应选 int8"
+        );
+        assert!(
+            f.decoder.to_string_lossy().contains(".int8."),
+            "Nemotron 的 decoder 必须按 catalog 选 int8"
+        );
+        assert!(
+            f.joiner.to_string_lossy().contains(".int8."),
+            "Nemotron 的 joiner 应选 int8"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn discover_falls_back_when_preferred_precision_is_absent() {
         let dir = temp_model_dir(&[
             "encoder-epoch-99-avg-1.onnx",
@@ -505,14 +567,16 @@ mod tests {
             "joiner-epoch-99-avg-1.onnx",
             "tokens.txt",
         ]);
-        assert!(discover_model_files(&dir).is_ok());
+        assert!(discover_model_files(&dir, builtin()).is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn discover_error_lists_actual_directory_contents() {
         let dir = temp_model_dir(&["encoder-epoch-99-avg-1.int8.onnx", "tokens.txt"]);
-        let msg = discover_model_files(&dir).unwrap_err().to_string();
+        let msg = discover_model_files(&dir, builtin())
+            .unwrap_err()
+            .to_string();
         assert!(msg.contains("decoder"), "{msg}");
         assert!(msg.contains("encoder-epoch-99-avg-1.int8.onnx"), "{msg}");
         std::fs::remove_dir_all(&dir).ok();
@@ -529,7 +593,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("64")).unwrap();
         std::fs::write(dir.join("64").join("encoder-x.onnx"), b"x").unwrap();
 
-        let f = discover_model_files(&dir).unwrap();
+        let f = discover_model_files(&dir, builtin()).unwrap();
         assert!(!f.encoder.to_string_lossy().contains("/64/"));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -537,7 +601,7 @@ mod tests {
 
     #[test]
     fn feed_before_init_is_an_error_not_a_panic() {
-        let mut a = StreamingAdapter::new();
+        let mut a = StreamingAdapter::new(builtin());
         assert!(matches!(
             a.feed_pcm(&[0.0; 1600]),
             Err(AsrError::NotInitialized)
@@ -546,7 +610,7 @@ mod tests {
 
     #[test]
     fn capabilities_declare_partial_support() {
-        let a = StreamingAdapter::new();
+        let a = StreamingAdapter::new(builtin());
         let c = a.capabilities();
         assert!(c.streaming && c.produces_partial && c.supports_endpoint);
         assert!(!c.requires_full_utterance);

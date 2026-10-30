@@ -11,6 +11,7 @@ use std::sync::{Mutex, TryLockError};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
 use crate::config::{OverlayConfig, OverlayMode, MAX_OVERLAY_HEIGHT, MIN_OVERLAY_HEIGHT};
+use crate::i18n::{tf, tr, Key};
 
 pub const LABEL: &str = "overlay";
 
@@ -66,6 +67,25 @@ pub(crate) enum Frame {
     Window(Box<WebviewWindow>),
 }
 
+#[cfg(target_os = "macos")]
+// tauri-nspanel 的 show/hide 直接发 AppKit 消息，必须落在主线程，否则 macOS 会 SIGTRAP。
+fn on_main<T, F>(app: &AppHandle, run: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if tauri_nspanel::objc2_foundation::MainThreadMarker::new().is_some() {
+        return Ok(run());
+    }
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    app.run_on_main_thread(move || {
+        let _ = tx.send(run());
+    })
+    .map_err(|e| e.to_string())?;
+    rx.recv().map_err(|e| e.to_string())
+}
+
 impl Frame {
     pub(crate) fn get(app: &AppHandle) -> Result<Self, String> {
         #[cfg(target_os = "macos")]
@@ -78,49 +98,57 @@ impl Frame {
 
         app.get_webview_window(LABEL)
             .map(|w| Self::Window(Box::new(w)))
-            .ok_or_else(|| format!("悬浮窗（label={LABEL}）不存在"))
+            .ok_or_else(|| tf(Key::OverlayNotFound, &[LABEL]))
     }
 
-    fn show(&self) -> Result<(), String> {
+    fn show(&self, app: &AppHandle) -> Result<(), String> {
         match self {
             #[cfg(target_os = "macos")]
             Self::Panel(p) => {
-                p.show();
-                Ok(())
+                let p = p.clone();
+                on_main(app, move || p.show()).map_err(|e| tf(Key::OverlayShowFailed, &[&e]))
             }
-            Self::Window(w) => w.show().map_err(|e| format!("显示悬浮窗失败：{e}")),
+            Self::Window(w) => w
+                .show()
+                .map_err(|e| tf(Key::OverlayShowFailed, &[&e.to_string()])),
         }
     }
 
-    fn hide(&self) -> Result<(), String> {
+    fn hide(&self, app: &AppHandle) -> Result<(), String> {
         match self {
             #[cfg(target_os = "macos")]
             Self::Panel(p) => {
-                p.hide();
-                Ok(())
+                let p = p.clone();
+                on_main(app, move || p.hide()).map_err(|e| tf(Key::OverlayHideFailed, &[&e]))
             }
-            Self::Window(w) => w.hide().map_err(|e| format!("隐藏悬浮窗失败：{e}")),
+            Self::Window(w) => w
+                .hide()
+                .map_err(|e| tf(Key::OverlayHideFailed, &[&e.to_string()])),
         }
     }
 
-    fn is_visible(&self) -> bool {
+    fn is_visible(&self, app: &AppHandle) -> bool {
         match self {
             #[cfg(target_os = "macos")]
-            Self::Panel(p) => p.is_visible(),
+            Self::Panel(p) => {
+                let p = p.clone();
+                on_main(app, move || p.is_visible()).unwrap_or(false)
+            }
             Self::Window(w) => w.is_visible().unwrap_or(false),
         }
     }
 
-    fn set_click_through(&self, on: bool) -> Result<(), String> {
+    fn set_click_through(&self, app: &AppHandle, on: bool) -> Result<(), String> {
         match self {
             #[cfg(target_os = "macos")]
             Self::Panel(p) => {
-                p.set_ignores_mouse_events(on);
-                Ok(())
+                let p = p.clone();
+                on_main(app, move || p.set_ignores_mouse_events(on))
+                    .map_err(|e| tf(Key::OverlayClickThroughFailed, &[&e]))
             }
             Self::Window(w) => w
                 .set_ignore_cursor_events(on)
-                .map_err(|e| format!("设置鼠标穿透失败：{e}")),
+                .map_err(|e| tf(Key::OverlayClickThroughFailed, &[&e.to_string()])),
         }
     }
 
@@ -161,17 +189,17 @@ pub(crate) fn set_geometry(
     app: &AppHandle,
     g: &crate::config::WindowGeometry,
 ) -> Result<(), String> {
-    let w = window(app).ok_or("悬浮窗底层窗口不可用")?;
+    let w = window(app).ok_or_else(|| tr(Key::OverlayWindowUnavailable))?;
     w.set_size(tauri::LogicalSize::new(
         g.size.width as f64,
         g.size.height as f64,
     ))
-    .map_err(|e| format!("设置悬浮窗尺寸失败：{e}"))?;
+    .map_err(|e| tf(Key::OverlaySizeFailed, &[&e.to_string()]))?;
     w.set_position(tauri::LogicalPosition::new(
         g.position.x as f64,
         g.position.y as f64,
     ))
-    .map_err(|e| format!("设置悬浮窗位置失败：{e}"))?;
+    .map_err(|e| tf(Key::OverlayPositionFailed, &[&e.to_string()]))?;
     Ok(())
 }
 
@@ -181,16 +209,17 @@ pub fn toggle(app: &AppHandle) -> Result<bool, String> {
     let cfg = save_and_apply_config(
         &state,
         |previous| OverlayConfig {
-            enable: !frame.is_visible(),
+            enable: !frame.is_visible(app),
             ..previous.clone()
         },
         |cfg| persist_config(app, cfg),
         |_, cfg| {
             if cfg.enable {
-                frame.show()?;
+                frame.show(app)?;
+                apply_mode(app, cfg.mode)?;
                 apply_fullscreen_overlay(app, &frame);
             } else {
-                frame.hide()?;
+                frame.hide(app)?;
             }
             crate::tray::sync_visibility(app, cfg.enable);
             Ok(())
@@ -209,7 +238,7 @@ pub fn toggle(app: &AppHandle) -> Result<bool, String> {
 }
 
 pub fn is_visible(app: &AppHandle) -> bool {
-    Frame::get(app).map(|f| f.is_visible()).unwrap_or(false)
+    Frame::get(app).map(|f| f.is_visible(app)).unwrap_or(false)
 }
 
 fn broadcast_visibility(app: &AppHandle, visible: bool) {
@@ -218,21 +247,29 @@ fn broadcast_visibility(app: &AppHandle, visible: bool) {
     }
 }
 
-fn apply_mode(app: &AppHandle, mode: OverlayMode) -> Result<(), String> {
-    let frame = Frame::get(app)?;
+fn apply_click_through(app: &AppHandle, frame: &Frame, mode: OverlayMode) -> Result<(), String> {
     let state = app.state::<OverlayState>();
-
     let want = mode.is_click_through();
-    if state.needs_click_through_write(want) {
-        if let Err(e) = frame.set_click_through(want) {
-            *state
-                .applied_click_through
-                .lock()
-                .expect("overlay click-through mutex poisoned") = None;
-            return Err(format!("{e}（mode={}）", mode.as_str()));
-        }
+
+    // 窗口未映射时 GdkWindow 还不存在，tao 的 set_ignore_cursor_events(true) 会直接 panic，
+    // 所以隐藏状态下只记住模式，等 show 之后再写。
+    if !frame.is_visible(app) || !state.needs_click_through_write(want) {
+        return Ok(());
     }
 
+    if let Err(e) = frame.set_click_through(app, want) {
+        *state
+            .applied_click_through
+            .lock()
+            .expect("overlay click-through mutex poisoned") = None;
+        return Err(format!("{e}（mode={}）", mode.as_str()));
+    }
+    Ok(())
+}
+
+fn apply_mode(app: &AppHandle, mode: OverlayMode) -> Result<(), String> {
+    let frame = Frame::get(app)?;
+    apply_click_through(app, &frame, mode)?;
     Ok(())
 }
 
@@ -394,9 +431,6 @@ pub fn init(
         fit_height_to_lines(app, &state.config());
     }
 
-    frame.set_click_through(mode.is_click_through())?;
-    state.needs_click_through_write(mode.is_click_through());
-
     apply_fullscreen_overlay(app, &frame);
 
     broadcast(app, &state);
@@ -413,10 +447,12 @@ pub fn init(
     );
 
     if applied.enable {
-        if let Err(e) = frame.show() {
+        if let Err(e) = frame.show(app) {
             tracing::error!("悬浮窗启动显示失败：{e}（可在悬浮窗页手动显示）");
         }
     }
+
+    apply_click_through(app, &frame, mode)?;
 
     #[cfg(target_os = "macos")]
     watchdog::start(app.clone());
@@ -492,7 +528,7 @@ pub fn debug_state(app: &AppHandle) -> Result<serde_json::Value, String> {
 
     let mut out = serde_json::json!({
         "label": frame.label(),
-        "visible": frame.is_visible(),
+        "visible": frame.is_visible(app),
         "clickThrough": app.state::<OverlayState>().mode_is_click_through(),
     });
 
@@ -538,6 +574,7 @@ mod tests {
             let path = directory.join("preferences.json");
             let original = crate::config::Preferences {
                 source_lang: "zh".into(),
+                target_lang: "en".into(),
                 ..Default::default()
             };
             crate::prefs::save_to(&path, &original).unwrap();

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -9,9 +9,11 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::asr::{AsrEngine, TARGET_SAMPLE_RATE};
 use crate::audio::{self, CaptureHandle, SILENCE_RMS};
 use crate::config::{
-    target_lang_for, AsrConfig, EngineType, MtModelTier, SessionConfig, TranslateConfig,
+    effective_target_lang, target_lang_for, AsrConfig, EngineType, MtModelTier, SessionConfig, TranslateConfig,
     TranslateEngine, ZhScript,
 };
+use crate::error::CmdError;
+use crate::i18n::{tf, tr, Key};
 use crate::models::catalog;
 use crate::paths;
 use crate::transcript::{TranscriptSegment, TranscriptStore, TranslationState};
@@ -25,33 +27,52 @@ use lifecycle::{ExclusiveOperation, Failure, Lifecycle};
 const TRANSLATE_QUEUE_CAPACITY: usize = 32;
 
 fn create_translator(
-    app: &AppHandle,
+    roots: &paths::ModelSearchRoots,
     cfg: &TranslateConfig,
-    mt_tier: MtModelTier,
 ) -> Result<Option<Box<dyn Translator>>, String> {
     let engine: Box<dyn Translator> = match cfg.engine {
         TranslateEngine::LocalNmt => {
-            let roots = paths::search_roots(app);
-            let resolved = paths::locate_mt_root(&roots, mt_tier)?;
+            let entry = catalog::mt_entry(cfg.mt_model_tier);
+            let resolved = paths::locate_mt_root(roots, entry)?;
             tracing::info!(
-                tier = mt_tier.as_str(),
                 via = resolved.via.as_str(),
                 path = %resolved.path.display(),
+                model = %entry.id,
                 "翻译模型目录"
             );
-            let missing = paths::missing_mt_files(&resolved.path, catalog::mt_entry(mt_tier))?;
+            let missing = paths::missing_mt_files(&resolved.path, entry)?;
             if !missing.is_empty() {
-                return Err(format!(
-                    "所选翻译模型「{}」未安装或文件不完整：{}\n缺少：{}\n→ 打开「模型」页下载，或切换回基础模型",
-                    catalog::mt_entry(mt_tier).title,
-                    resolved.path.display(),
-                    missing.join(", ")
+                return Err(tf(
+                    Key::TranslateSessionModelMissing,
+                    &[
+                        &entry.localized_title(),
+                        &resolved.path.display().to_string(),
+                        &missing.join(", "),
+                    ],
                 ));
             }
-            Box::new(crate::translate::local_nmt::LocalNmt::new(
-                resolved.path,
-                mt_tier,
-            ))
+            match entry.mt_format() {
+                Some(catalog::MtFormat::Marian) => {
+                    Box::new(crate::translate::local_nmt::LocalNmt::new(resolved.path))
+                }
+                Some(catalog::MtFormat::Nllb) => {
+                    Box::new(crate::translate::nllb::NllbTranslator::new(resolved.path))
+                }
+                Some(catalog::MtFormat::Lmt) => Box::new(
+                    crate::translate::lmt::LmtTranslator::new(resolved.path, cfg.mt_model_tier),
+                ),
+                None => return Err(tf(Key::TranslateEngineNotWired, &[&entry.id])),
+            }
+        }
+        TranslateEngine::MacTranslation => {
+            #[cfg(target_os = "macos")]
+            {
+                Box::new(crate::translate::mac_translation::MacTranslator::new())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err(tf(Key::TranslateEngineNotWired, &[cfg.engine.as_str()]));
+            }
         }
         TranslateEngine::Mock => {
             let fail_every = std::env::var(crate::translate::mock::ENV_FAIL_EVERY)
@@ -65,14 +86,98 @@ fn create_translator(
         }
         TranslateEngine::Off => return Ok(None),
         TranslateEngine::RemoteApi => {
-            return Err(format!(
-                "翻译引擎 {} 尚未接入。可选值：local-nmt（本地离线）、mock（开发用）、off（仅显示原文）",
-                cfg.engine.as_str()
-            ));
+            return Err(tf(Key::TranslateEngineNotWired, &[cfg.engine.as_str()]));
         }
     };
 
     Ok(Some(engine))
+}
+
+fn translate_init_error(error: crate::translate::TranslateError) -> CmdError {
+    let message = tf(Key::SessionTranslateInitFailed, &[&error.to_string()]);
+    match error {
+        crate::translate::TranslateError::PlatformUnavailable(_) => CmdError::Settings { pane: "translation", message },
+        _ => CmdError::Failed(message),
+    }
+}
+
+fn is_han(c: char) -> bool {
+    matches!(c, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
+}
+
+fn is_kana(c: char) -> bool {
+    matches!(c, '\u{3040}'..='\u{30FF}')
+}
+
+fn is_hangul(c: char) -> bool {
+    matches!(c, '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}' | '\u{AC00}'..='\u{D7AF}')
+}
+
+fn language_mismatch(text: &str, source_lang: &str) -> bool {
+    let mut han = 0usize;
+    let mut kana = 0usize;
+    let mut hangul = 0usize;
+    let mut latin = 0usize;
+    for c in text.chars() {
+        if is_han(c) {
+            han += 1;
+        } else if is_kana(c) {
+            kana += 1;
+        } else if is_hangul(c) {
+            hangul += 1;
+        } else if c.is_ascii_alphabetic() {
+            latin += 1;
+        }
+    }
+    let cjk = han + kana + hangul;
+    let total = cjk + latin;
+    if total < 2 {
+        return false;
+    }
+    if source_lang.starts_with("zh") {
+        latin >= 3 && latin * 10 >= total * 9
+    } else if source_lang.starts_with("en") {
+        cjk >= 2 && cjk * 4 >= total * 3
+    } else if source_lang.starts_with("ja") {
+        kana == 0 && (hangul > 0 || latin >= 3)
+    } else if source_lang.starts_with("ko") {
+        hangul == 0 && (kana > 0 || latin >= 3)
+    } else {
+        false
+    }
+}
+
+const MISMATCH_WINDOW: Duration = Duration::from_secs(20);
+const MISMATCH_MIN_DURATION: Duration = Duration::from_secs(10);
+const MISMATCH_MIN_SEGMENTS: usize = 3;
+
+#[derive(Default)]
+struct MismatchTracker {
+    window: VecDeque<(Instant, bool)>,
+}
+
+impl MismatchTracker {
+    fn observe(&mut self, now: Instant, mismatched: bool) -> bool {
+        self.window.push_back((now, mismatched));
+        while let Some((at, _)) = self.window.front() {
+            if now.duration_since(*at) > MISMATCH_WINDOW {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.window.len() < MISMATCH_MIN_SEGMENTS {
+            return false;
+        }
+        let Some((first, _)) = self.window.front() else {
+            return false;
+        };
+        if now.duration_since(*first) < MISMATCH_MIN_DURATION {
+            return false;
+        }
+        let bad = self.window.iter().filter(|(_, m)| *m).count();
+        bad * 5 >= self.window.len() * 4
+    }
 }
 
 pub const EVENT_SEGMENTS: &str = "transcript://segments";
@@ -80,6 +185,8 @@ pub const EVENT_TASK_STATE: &str = "transcript://state";
 pub const EVENT_AUDIO: &str = "transcript://audio";
 pub const EVENT_LEVEL: &str = "transcript://level";
 pub const EVENT_ERROR: &str = "transcript://error";
+pub const EVENT_LANGUAGE_MISMATCH: &str = "transcript://language-mismatch";
+
 
 #[typeshare::typeshare]
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -158,6 +265,7 @@ struct RunningSession {
     translation: Option<TranslationSession>,
     traditional_source: bool,
     timestamp_offset_ms: u64,
+    mismatch_source: Option<String>,
     events: Sender<UiEvent>,
 }
 
@@ -167,6 +275,7 @@ enum UiEvent {
     Level(f64),
     Audio(AudioStatus),
     Segments(Vec<TranscriptSegment>),
+    LanguageMismatch(bool),
 }
 
 static EVENT_SENDER: std::sync::OnceLock<Sender<UiEvent>> = std::sync::OnceLock::new();
@@ -202,6 +311,11 @@ pub fn init_emitter(app: &AppHandle) -> Result<(), String> {
                             tracing::debug!("广播音频状态失败（可能没有窗口）：{e}");
                         }
                     }
+                    UiEvent::LanguageMismatch(mismatch) => {
+                        if let Err(e) = app.emit(EVENT_LANGUAGE_MISMATCH, mismatch) {
+                            tracing::debug!("广播语言不匹配提示失败（可能没有窗口）：{e}");
+                        }
+                    }
                 }
 
                 let ms = t0.elapsed().as_millis();
@@ -211,7 +325,7 @@ pub fn init_emitter(app: &AppHandle) -> Result<(), String> {
             }
             tracing::debug!("事件线程退出");
         })
-        .map_err(|e| format!("启动事件线程失败：{e}"))?;
+        .map_err(|e| tf(Key::SessionEventThreadStartFailed, &[&e.to_string()]))?;
 
     let _ = EVENT_SENDER.set(tx);
     Ok(())
@@ -221,7 +335,7 @@ fn events_sender() -> Result<Sender<UiEvent>, String> {
     EVENT_SENDER
         .get()
         .cloned()
-        .ok_or_else(|| "事件线程未初始化".to_string())
+        .ok_or_else(|| tr(Key::SessionEventThreadMissing).to_string())
 }
 
 fn notify_state_changed() {
@@ -463,6 +577,20 @@ impl SessionState {
             .is_some()
     }
 
+    pub(crate) fn wait_until_idle(&self, timeout: Duration) -> bool {
+        let limit = timeout.as_millis() as u64;
+        let mut waited_ms = 0u64;
+        while self.teardown_active.load(Ordering::SeqCst) && waited_ms < limit {
+            std::thread::sleep(Duration::from_millis(100));
+            waited_ms += 100;
+        }
+        let idle = !self.teardown_active.load(Ordering::SeqCst);
+        if waited_ms > 0 {
+            tracing::info!(ms = waited_ms, "等待上一次会话收尾完成");
+        }
+        idle
+    }
+
     pub fn info(&self) -> SessionInfo {
         let guard = self
             .lifecycle
@@ -526,11 +654,20 @@ pub fn start(
     app: &AppHandle,
     cfg: SessionConfig,
     source: audio::AudioSourceKind,
-    device: Option<String>,
-) -> Result<(), String> {
+    devices: audio::DeviceSelection,
+) -> Result<(), CmdError> {
     let t0 = Instant::now();
     let mut cfg = cfg;
-    cfg.translate.target_lang = target_lang_for(&cfg.translate.source_lang).to_owned();
+    let prefs = crate::prefs::load(app);
+    cfg.translate.mt_model_tier = prefs.mt_model_tier;
+    let target_lang = effective_target_lang(
+        cfg.translate.engine,
+        cfg.translate.mt_model_tier,
+        &cfg.translate.source_lang,
+        &cfg.translate.target_lang,
+    )
+    .to_owned();
+    cfg.translate.target_lang = target_lang;
 
     tracing::info!("启动：收到命令");
     let state = app.state::<SessionState>();
@@ -539,19 +676,11 @@ pub fn start(
     }
 
     if state.is_running() {
-        return Err("已在采集中".into());
+        return Err(tr(Key::SessionAlreadyCapturing).into());
     }
 
-    let mut waited_ms = 0u64;
-    while state.teardown_active.load(Ordering::SeqCst) && waited_ms < 5000 {
-        std::thread::sleep(Duration::from_millis(100));
-        waited_ms += 100;
-    }
-    if state.teardown_active.load(Ordering::SeqCst) {
-        return Err("上一次会话仍在收尾（音频设备尚未释放），请稍后重试".into());
-    }
-    if waited_ms > 0 {
-        tracing::info!(ms = waited_ms, "启动前等待上一次收尾完成");
+    if !state.wait_until_idle(Duration::from_secs(5)) {
+        return Err(tr(Key::SessionTeardownBusy).into());
     }
 
     if let Some(workspace) = app.try_state::<crate::workspace::WorkspaceState>() {
@@ -587,82 +716,111 @@ pub fn start(
         .expect("audio start mutex poisoned") = None;
     let _ = events.send(UiEvent::StateChanged);
 
-    if !matches!(cfg.asr.engine_type, EngineType::LocalStreaming) {
-        return Err(format!(
-            "引擎 {} 尚未接入（当前仅支持 local-streaming）",
-            cfg.asr.engine_type.as_str()
-        ));
-    }
+    let roots = paths::search_roots(app);
 
     if let Some(workspace) = app.try_state::<crate::workspace::WorkspaceState>() {
         workspace.begin_capture(&cfg.translate.source_lang);
     }
-    let prefs = crate::prefs::load(app);
-    let asr_entry = catalog::asr_entry(prefs.asr_model_tier);
+    let (mut engine, engine_cfg): (Box<dyn AsrEngine>, AsrConfig) = match cfg.asr.engine_type {
+        EngineType::MacNative => {
+            let engine_cfg = AsrConfig {
+                model_dir: None,
+                source_lang: cfg.translate.source_lang.clone(),
+                ..cfg.asr.clone()
+            };
+            (
+                Box::new(crate::asr::mac_native::MacNativeAdapter::new()),
+                engine_cfg,
+            )
+        }
+        EngineType::LocalStreaming => {
+            let asr_entry = catalog::asr_entry(prefs.asr_model_tier);
+            let asr_dir = if let Some(custom) = cfg
+                .asr
+                .model_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let dir = dunce::simplified(std::path::Path::new(custom)).to_path_buf();
+                if !dir.is_dir() {
+                    return Err(
+                        tf(Key::SessionCustomAsrMissing, &[&dir.display().to_string()]).into(),
+                    );
+                }
+                let missing = paths::missing_asr_files(&dir, asr_entry)?;
+                if !missing.is_empty() {
+                    return Err(tf(
+                        Key::SessionCustomAsrIncomplete,
+                        &[&dir.display().to_string(), &missing.join(", ")],
+                    )
+                    .into());
+                }
+                tracing::info!(path = %dir.display(), "使用自定义 ASR 模型目录");
+                dir
+            } else {
+                let resolved = paths::locate_asr(&roots, prefs.asr_model_tier)?;
+                tracing::info!(
+                    tier = prefs.asr_model_tier.as_str(),
+                    via = resolved.via.as_str(),
+                    path = %resolved.path.display(),
+                    "会话使用 ASR 模型"
+                );
+                let missing = paths::missing_asr_files(&resolved.path, asr_entry)?;
+                if !missing.is_empty() {
+                    return Err(tf(
+                        Key::SessionAsrModelIncomplete,
+                        &[
+                            &asr_entry.localized_title(),
+                            &resolved.path.display().to_string(),
+                            &missing.join(", "),
+                        ],
+                    )
+                    .into());
+                }
+                resolved.path
+            };
 
-    let asr_dir = if let Some(custom) = cfg
-        .asr
-        .model_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let dir = dunce::simplified(std::path::Path::new(custom)).to_path_buf();
-        if !dir.is_dir() {
-            return Err(format!("自定义 ASR 模型目录不存在：{}", dir.display()));
+            let engine: Box<dyn AsrEngine> = match asr_entry.asr_format() {
+                Some(catalog::AsrFormat::Transducer) => {
+                    Box::new(crate::asr::streaming::StreamingAdapter::new(asr_entry))
+                }
+                Some(catalog::AsrFormat::Qwen3Asr) => {
+                    let vad = paths::vad_model_path(&roots)
+                        .ok_or_else(|| tf(Key::AsrVadModelMissing, &[paths::VAD_MODEL_FILE]))?;
+                    Box::new(crate::asr::offline::Qwen3OfflineAdapter::new(
+                        vad, asr_entry,
+                    ))
+                }
+                None => return Err(tf(Key::AsrInvalidConfig, &[&asr_entry.id]).into()),
+            };
+            let engine_cfg = AsrConfig {
+                model_dir: Some(asr_dir.to_string_lossy().into_owned()),
+                ..cfg.asr.clone()
+            };
+            (engine, engine_cfg)
         }
-        let missing = paths::missing_asr_files(&dir, asr_entry)?;
-        if !missing.is_empty() {
-            return Err(format!(
-                "自定义 ASR 模型目录不完整：{}\n缺少：{}",
-                dir.display(),
-                missing.join(", ")
-            ));
+        other => {
+            return Err(tf(Key::SessionEngineNotWired, &[other.as_str()]).into());
         }
-        tracing::info!(path = %dir.display(), "使用自定义 ASR 模型目录");
-        dir
-    } else {
-        let roots = paths::search_roots(app);
-        let resolved = paths::locate_asr(&roots, prefs.asr_model_tier)?;
-        tracing::info!(
-            tier = prefs.asr_model_tier.as_str(),
-            via = resolved.via.as_str(),
-            path = %resolved.path.display(),
-            "会话使用 ASR 模型"
-        );
-        let missing = paths::missing_asr_files(&resolved.path, asr_entry)?;
-        if !missing.is_empty() {
-            return Err(format!(
-                "所选语音识别模型「{}」未安装或文件不完整：{}\n缺少：{}\n→ 打开「模型」页下载，或切换回内置模型",
-                asr_entry.title,
-                resolved.path.display(),
-                missing.join(", ")
-            ));
-        }
-        resolved.path
-    };
-
-    let mut engine = crate::asr::streaming::StreamingAdapter::new();
-    let engine_cfg = AsrConfig {
-        model_dir: Some(asr_dir.to_string_lossy().into_owned()),
-        ..cfg.asr.clone()
     };
     engine
         .init(&engine_cfg)
-        .map_err(|e| format!("引擎初始化失败：{e}"))?;
+        .map_err(|e| tf(Key::SessionAsrInitFailed, &[&e.to_string()]))?;
     tracing::info!(
+        engine = cfg.asr.engine_type.as_str(),
         caps = ?engine.capabilities(),
         ms = t0.elapsed().as_millis(),
         "ASR 引擎已就绪"
     );
 
-    let engine: Arc<Mutex<Box<dyn AsrEngine>>> = Arc::new(Mutex::new(Box::new(engine)));
+    let engine: Arc<Mutex<Box<dyn AsrEngine>>> = Arc::new(Mutex::new(engine));
 
-    let translation = match create_translator(app, &cfg.translate, prefs.mt_model_tier)? {
+    let translation = match create_translator(&roots, &cfg.translate)? {
         Some(mut translator) => {
             translator
                 .init(&cfg.translate)
-                .map_err(|e| format!("翻译引擎初始化失败：{e}"))?;
+                .map_err(translate_init_error)?;
             tracing::info!(
                 engine = cfg.translate.engine.as_str(),
                 caps = ?translator.capabilities(),
@@ -705,6 +863,11 @@ pub fn start(
     let mut level_sq = 0.0f64;
     let mut level_n = 0usize;
     let mut level_emit_failed = false;
+    let mut mismatch_tracker = MismatchTracker::default();
+    let mut mismatch_reported = false;
+    let mismatch_source = (cfg.translate.engine == TranslateEngine::LocalNmt)
+        .then(|| cfg.translate.source_lang.clone());
+    let mismatch_for_tail = mismatch_source.clone();
     let mut first_text_logged = false;
     let mut non_silent_started_at = None;
 
@@ -720,7 +883,7 @@ pub fn start(
         && cfg.translate.zh_script == ZhScript::Traditional;
     let audio_clock = Arc::clone(&state.audio_started_at);
     let events_for_failure = events.clone();
-    let capture = audio::start(source, device.as_deref(), move |chunk: &[f32]| {
+    let capture = audio::start(source, &devices, move |chunk: &[f32]| {
         {
             let mut clock = audio_clock.lock().expect("audio start mutex poisoned");
             if clock.is_none() {
@@ -825,14 +988,21 @@ pub fn start(
             return Ok(());
         }
         offset_segments(&mut deltas, timestamp_offset_ms);
-        let changed = apply_asr_output(
+        let changed = apply_asr_output_checked(
             &store,
             deltas,
             traditional_source,
             queue_for_sink.as_deref(),
             &events_for_sink,
+            mismatch_source.as_deref(),
         )?;
         for seg in &changed {
+            if let Some(source) = mismatch_source.as_deref() {
+                if seg.state.is_frozen() && mismatch_tracker.observe(Instant::now(), language_mismatch(&seg.text, source)) && !mismatch_reported {
+                    mismatch_reported = true;
+                    let _ = events_for_sink.send(UiEvent::LanguageMismatch(true));
+                }
+            }
             if seg.state.is_frozen() {
                 let audio_ms: i128 = audio_clock
                     .lock()
@@ -851,7 +1021,7 @@ pub fn start(
     }, move |message| {
         let _ = events_for_failure.send(UiEvent::Failed { epoch, message });
     })
-    .map_err(|e| format!("启动采集失败：{e}"))?;
+    .map_err(|e| tf(Key::SessionStartCaptureFailed, &[&e.to_string()]))?;
 
     let device_name = capture.device_name().to_string();
     let device_sample_rate = capture.device_sample_rate();
@@ -872,6 +1042,7 @@ pub fn start(
         translation,
         traditional_source,
         timestamp_offset_ms,
+        mismatch_source: mismatch_for_tail,
         events: events.clone(),
     };
     let published = {
@@ -896,7 +1067,7 @@ pub fn start(
     if let Err((session, error)) = published {
         let _ = events.send(UiEvent::StateChanged);
         schedule_teardown(app, session);
-        return Err(error);
+        return Err(error.into());
     }
 
     tracing::info!(
@@ -911,6 +1082,7 @@ pub fn start(
             "audio_source": source.as_str(),
             "translate_engine": cfg.translate.engine.as_str(),
             "source_lang": cfg.translate.source_lang,
+            "target_lang": cfg.translate.target_lang,
             "zh_script": cfg.translate.zh_script.as_str(),
             "asr_model_tier": prefs.asr_model_tier.as_str(),
             "custom_asr_model": if cfg.asr.model_dir.as_deref().is_some_and(|s| !s.trim().is_empty()) { 1 } else { 0 },
@@ -1052,7 +1224,7 @@ pub fn init_teardown_executor() -> Result<(), String> {
             }
             tracing::debug!("收尾线程退出");
         })
-        .map_err(|e| format!("启动收尾线程失败：{e}"))?;
+        .map_err(|e| tf(Key::SessionTeardownThreadStartFailed, &[&e.to_string()]))?;
     let _ = TEARDOWN_TX.set(tx);
     Ok(())
 }
@@ -1082,6 +1254,7 @@ fn teardown(app: &AppHandle, session: RunningSession) {
         translation,
         traditional_source,
         timestamp_offset_ms,
+        mismatch_source,
         events,
         ..
     } = session;
@@ -1131,7 +1304,7 @@ fn teardown(app: &AppHandle, session: RunningSession) {
             .translator
             .lock()
             .expect("translator mutex poisoned");
-        let changed = translate_final_tail(&state.store, changed, Some(translator.as_mut()));
+        let changed = translate_final_tail_checked(&state.store, changed, Some(translator.as_mut()), mismatch_source.as_deref());
         translator.shutdown();
         changed
     } else {
@@ -1157,6 +1330,7 @@ fn retry_config(app: &AppHandle, source_lang: Option<&str>) -> (TranslateConfig,
             target_lang: target_lang_for(&source_lang).into(),
             source_lang,
             zh_script: prefs.zh_script,
+            mt_model_tier: prefs.mt_model_tier,
             ..Default::default()
         },
         prefs.mt_model_tier,
@@ -1189,8 +1363,8 @@ pub fn retry_translations(app: &AppHandle, ids: &[String]) -> Result<(), String>
     let source_lang = app
         .try_state::<crate::workspace::WorkspaceState>()
         .map(|s| s.source_lang());
-    let (config, tier) = retry_config(app, source_lang.as_deref());
-    let translator = create_translator(app, &config, tier).and_then(|translator| {
+    let (config, _tier) = retry_config(app, source_lang.as_deref());
+    let translator = create_translator(&paths::search_roots(app), &config).and_then(|translator| {
         let mut translator = translator.ok_or("请启用本地翻译引擎")?;
         translator.init(&config).map_err(|e| e.to_string())?;
         Ok(translator)
@@ -1259,8 +1433,8 @@ pub fn retranslate_record(
         .as_deref()
         .filter(|language| matches!(*language, "en" | "zh"))
         .ok_or("请先在记录来源中设置原文语言，再重新翻译")?;
-    let (config, tier) = retry_config(app, Some(language));
-    let mut translator = create_translator(app, &config, tier)?.ok_or("请启用本地翻译引擎")?;
+    let (config, _tier) = retry_config(app, Some(language));
+    let mut translator = create_translator(&paths::search_roots(app), &config)?.ok_or("请启用本地翻译引擎")?;
     translator.init(&config).map_err(|e| e.to_string())?;
     let mut errors = Vec::new();
     for entry in selected {
@@ -1314,10 +1488,21 @@ fn offset_segments(segments: &mut [TranscriptSegment], offset: u64) {
 
 fn apply_asr_output(
     store: &Mutex<TranscriptStore>,
+    deltas: Vec<TranscriptSegment>,
+    traditional_source: bool,
+    queue: Option<&JobQueue>,
+    events: &Sender<UiEvent>,
+) -> Result<Vec<TranscriptSegment>, String> {
+    apply_asr_output_checked(store, deltas, traditional_source, queue, events, None)
+}
+
+fn apply_asr_output_checked(
+    store: &Mutex<TranscriptStore>,
     mut deltas: Vec<TranscriptSegment>,
     traditional_source: bool,
     queue: Option<&JobQueue>,
     events: &Sender<UiEvent>,
+    mismatch_source: Option<&str>,
 ) -> Result<Vec<TranscriptSegment>, String> {
     if traditional_source {
         for segment in &mut deltas {
@@ -1331,7 +1516,8 @@ fn apply_asr_output(
     if !changed.is_empty() {
         // 新段落必须先于翻译任务广播，否则快速译文会改变前端首次看到的段序。
         let _ = events.send(UiEvent::Segments(changed.clone()));
-        let updates = schedule_translation(&mut store, &changed, queue);
+        let eligible = changed.iter().filter(|segment| mismatch_source.is_none_or(|source| !language_mismatch(&segment.text, source))).cloned().collect::<Vec<_>>();
+        let updates = schedule_translation(&mut store, &eligible, queue);
         if !updates.is_empty() {
             let _ = events.send(UiEvent::Segments(updates));
         }
@@ -1344,6 +1530,15 @@ fn translate_final_tail(
     changed: Vec<TranscriptSegment>,
     translator: Option<&mut dyn Translator>,
 ) -> Vec<TranscriptSegment> {
+    translate_final_tail_checked(store, changed, translator, None)
+}
+
+fn translate_final_tail_checked(
+    store: &Mutex<TranscriptStore>,
+    changed: Vec<TranscriptSegment>,
+    translator: Option<&mut dyn Translator>,
+    mismatch_source: Option<&str>,
+) -> Vec<TranscriptSegment> {
     let Some(translator) = translator else {
         return changed;
     };
@@ -1351,6 +1546,7 @@ fn translate_final_tail(
         .iter()
         .filter(|segment| {
             segment.state.is_frozen() && segment.translation_state == TranslationState::Idle
+                && mismatch_source.is_none_or(|source| !language_mismatch(&segment.text, source))
         })
         .map(|segment| segment.id.clone())
         .collect::<Vec<_>>();
@@ -1569,6 +1765,21 @@ mod tests {
         let mut segment = seg(id, "只有原文", 1);
         segment.state = SegmentState::Final;
         segment
+    }
+
+    #[test]
+    fn mismatched_final_text_is_preserved_but_not_queued_or_translated_at_stop() {
+        let store = Mutex::new(TranscriptStore::new());
+        let queue = JobQueue::new(4);
+        let (events, _) = std::sync::mpsc::channel();
+        let changed = apply_asr_output_checked(&store, vec![finalized("mismatch")], false, Some(&queue), &events, Some("en")).unwrap();
+        assert!(queue.drain_pending().is_empty());
+        assert_eq!(changed[0].translation_state, TranslationState::Idle);
+        let mut translator = crate::translate::mock::MockTranslator::new(Duration::ZERO, 0);
+        translator.init(&TranslateConfig::default()).unwrap();
+        let result = translate_final_tail_checked(&store, changed, Some(&mut translator), Some("en"));
+        assert_eq!(result[0].translation_state, TranslationState::Idle);
+        assert_eq!(result[0].text, "只有原文");
     }
 
     #[test]
@@ -2060,5 +2271,97 @@ mod tests {
         assert_eq!(translated[0].translation_state, TranslationState::Failed);
         assert_eq!(translated[0].text, "只有原文");
         assert_eq!(translated[0].translation, None);
+    }
+
+    #[test]
+    fn script_mismatch_is_detected_only_for_dominant_scripts() {
+        assert!(language_mismatch("你好，世界。", "en"));
+        assert!(!language_mismatch("hello world", "en"));
+        assert!(language_mismatch("hello world", "zh"));
+        assert!(!language_mismatch("你好，世界。", "zh"));
+        assert!(
+            !language_mismatch("OpenAI 很好", "en"),
+            "中英混说里的中文片段不该被判为语言不匹配"
+        );
+        assert!(!language_mismatch("我们用 OpenAI 很好", "en"));
+        assert!(language_mismatch("这个方案不错", "en"));
+        assert!(!language_mismatch("OpenAI 很好", "zh"));
+        assert!(!language_mismatch(
+            "The meeting with 王伟 was productive",
+            "en"
+        ));
+        assert!(!language_mismatch("Hi", "zh"));
+    }
+
+    #[test]
+    fn script_mismatch_covers_multilingual_sources() {
+        assert!(language_mismatch("hello world", "ja"));
+        assert!(!language_mismatch("こんにちは", "ja"));
+        assert!(language_mismatch("안녕하세요", "ja"));
+        assert!(language_mismatch("hello world", "ko"));
+        assert!(!language_mismatch("안녕하세요", "ko"));
+        assert!(!language_mismatch("hello world", "fr"));
+        assert!(!language_mismatch("bonjour tout le monde", "fr"));
+    }
+
+    #[test]
+    fn mismatch_alert_waits_for_a_sustained_window() {
+        let t0 = Instant::now();
+        let mut tracker = MismatchTracker::default();
+        for i in 0..3 {
+            assert!(!tracker.observe(t0 + Duration::from_secs(i * 3), true));
+        }
+        assert!(tracker.observe(t0 + Duration::from_secs(12), true));
+    }
+
+    #[test]
+    fn mismatch_alert_ignores_mixed_speech() {
+        let t0 = Instant::now();
+        let mut tracker = MismatchTracker::default();
+        let samples = [true, false, true, false, true, false, true, false];
+        let mut fired = false;
+        for (i, mismatched) in samples.iter().enumerate() {
+            fired |= tracker.observe(t0 + Duration::from_secs(i as u64 * 3), *mismatched);
+        }
+        assert!(!fired, "中英混杂时不该弹语言不匹配提示");
+    }
+
+    #[test]
+    fn mismatch_alert_needs_enough_segments() {
+        let t0 = Instant::now();
+        let mut tracker = MismatchTracker::default();
+        assert!(!tracker.observe(t0, true));
+        assert!(!tracker.observe(t0 + Duration::from_secs(10), true));
+    }
+
+    #[test]
+    fn mismatch_alert_forgets_old_segments() {
+        let t0 = Instant::now();
+        let mut tracker = MismatchTracker::default();
+        let mut fired = tracker.observe(t0, true);
+        fired |= tracker.observe(t0 + Duration::from_secs(30), true);
+        fired |= tracker.observe(t0 + Duration::from_secs(60), true);
+        assert!(!fired, "窗口外的旧段落不该累积成语言不匹配");
+    }
+
+    #[test]
+    fn platform_unavailable_points_at_the_translation_settings_pane() {
+        let err = translate_init_error(crate::translate::TranslateError::PlatformUnavailable(
+            "en → ja 语言包未安装".into(),
+        ));
+        assert!(matches!(
+            err,
+            CmdError::Settings {
+                pane: "translation",
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("语言包未安装"));
+    }
+
+    #[test]
+    fn other_translate_errors_do_not_offer_the_settings_pane() {
+        let err = translate_init_error(crate::translate::TranslateError::NotInitialized);
+        assert!(matches!(err, CmdError::Failed(_)));
     }
 }

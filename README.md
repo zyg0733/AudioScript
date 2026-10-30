@@ -1,10 +1,14 @@
+<p align="center">
+  <strong>English</strong> &nbsp;|&nbsp; <a href="README.zh-CN.md">简体中文</a>
+</p>
+
 <div align="center">
 
 <img src="src-tauri/icons/128x128@2x.png" width="128" height="128" alt="AudioScript">
 
-<h1>AudioScript 声稿</h1>
+<h1>AudioScript</h1>
 
-<p>监听系统声音输出，把外语播客与外文视频实时转成「原文 + 中文译文」双语悬浮字幕。识别与翻译全部在本机完成。</p>
+<p>Listen to your system audio and turn foreign podcasts, videos, and meetings into live bilingual subtitles: source text plus translation. Recognition and translation run entirely on your machine, with 29+ languages supported. On macOS 26+, system translation is also available.</p>
 
 <p>
   <a href="https://zyg0733.github.io/AudioScript/">官网</a> ·
@@ -13,6 +17,8 @@
 
 <p>
   <img src="https://img.shields.io/badge/macOS-14.2%2B-111111?style=flat-square&logo=apple&logoColor=white" alt="macOS 14.2+">
+  <img src="https://img.shields.io/badge/Windows-10%2B-111111?style=flat-square&logo=windows&logoColor=white" alt="Windows 10+">
+  <img src="https://img.shields.io/badge/Ubuntu-24-111111?style=flat-square&logo=ubuntu&logoColor=white" alt="Ubuntu 24">
   <img src="https://img.shields.io/badge/Tauri-2-24C8DB?style=flat-square&logo=tauri&logoColor=white" alt="Tauri 2">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-555555?style=flat-square" alt="MIT"></a>
 </p>
@@ -23,28 +29,30 @@
 
 <br>
 
-https://github.com/user-attachments/assets/10649363-0b68-45f5-aa0b-97a9135dab53
+https://github.com/user-attachments/assets/b1f88a82-b3fe-4721-8736-af6a9e4d828e
 
-## 功能
+## Features
 
-- **采集**：系统声音 / 麦克风 / 两者混合。
-- **实时离线**：sherpa-onnx 流式识别 + CTranslate2 opus-mt 翻译（en ↔ zh）
-- **字幕悬窗**：双语对照，字号 / 不透明度 / 行数可调
-- **常驻**：托盘、关窗不退出、单实例、开机自启。
+- **Capture**: system audio / microphone / both mixed.
+- **Background**: tray-resident, closing the window does not quit, single instance, launch at login.
+- **Recognition**: bundled Zipformer streaming bilingual recognition; optional X-ASR, Nemotron 3.5, and Qwen3-ASR.
+- **Translation**: bundled Opus-MT en ↔ zh; optional LMT-60 and NLLB-200.
+- **Overlay**: bilingual source and translation; adjustable font size, opacity, line count, and a colorful flowing border.
+- **Internationalization**: zh-CN / zh-TW / en / ja / ko / fr / de / es / pt-BR / ru / it / id / ar.
 
-## 隐私
+## Privacy
 
 * 语音识别与转译全部在本机完成，离线可用。
 * 匿名使用统计默认关闭。仅在构建时配置维护者自己的 Aptabase App Key 后，用户才能在「通用 → 隐私」中主动开启；未配置的构建不加载统计插件。
 * 自动更新仅连接本仓库 Releases，并验证本仓库公钥。普通本地构建未配置公钥时禁用更新，可从上方下载入口手动安装。
 
-## 构建
+## Build
 
 ```bash
-pnpm install          # 依赖 + ASR 模型（≈ 58 MB）
-pnpm fetch:mt         # 模型拉取
-pnpm tauri dev        # 开发模式
-pnpm tauri build      # 打包
+pnpm install          # deps + ASR model and Silero VAD (≈ 59 MB)
+pnpm fetch:mt         # fetch models
+pnpm tauri dev        # dev mode
+pnpm tauri build      # package
 ```
 
 
@@ -56,8 +64,10 @@ pnpm tauri build      # 打包
 - 原项目作者 Nico：X [@niyongsheng](https://x.com/niyongsheng)，E‑mail niyongsheng@Outlook.com。
 - [赞助原作者 Nico](https://ifdian.net/a/nico2026)：此入口属于原作者。
 
-## 许可证
+## License
 
 - [MIT](LICENSE)  
 
-- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) Apache-2.0、[CTranslate2](https://github.com/OpenNMT/CTranslate2) MIT、[opus-mt](https://github.com/Helsinki-NLP)、[flexaudio](https://crates.io/crates/flexaudio) MIT、[tauri-nspanel](https://github.com/ahkohd/tauri-nspanel) MIT OR Apache-2.0
+- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) Apache-2.0, [X-ASR](https://huggingface.co/GilgameshWind/X-ASR-zh-en) Apache-2.0, [Nemotron 3.5 ASR](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) OpenMDW-1.1 (optional), [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) Apache-2.0, [Silero VAD](https://github.com/snakers4/silero-vad) MIT, [CTranslate2](https://github.com/OpenNMT/CTranslate2) MIT, [opus-mt](https://github.com/Helsinki-NLP), [LMT-60](https://huggingface.co/NiuTrans/LMT-60-0.6B) Apache-2.0 (optional), [NLLB-200](https://huggingface.co/facebook/nllb-200-distilled-600M) CC-BY-NC-4.0 (optional), [translation-rs](https://github.com/doom-fish/translation-rs) MIT OR Apache-2.0, [flexaudio](https://crates.io/crates/flexaudio) MIT, [tauri-nspanel](https://github.com/ahkohd/tauri-nspanel) MIT OR Apache-2.0
+
+[![Star History Chart](https://api.star-history.com/svg?repos=niyongsheng/AudioScript&type=Date)](https://star-history.com/#niyongsheng/AudioScript&Date)

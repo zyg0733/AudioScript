@@ -1,5 +1,6 @@
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { setTrackingEnabled, track } from '@/shared/analytics'
+import { t } from '@/shared/i18n'
 import {
   type AppInfo,
   AudioSourceKind,
@@ -7,12 +8,16 @@ import {
   appInfo,
   audioDevices,
   type CmdPermissionError,
+  EngineType,
   EVENT,
   formatCmdError,
   type HotkeyFailure,
   type HotkeyInfo,
   hotkeyFailures,
   type InputDevice,
+  Language,
+  type MacSpeechStatus,
+  macSpeechStatus,
   type OverlayConfig,
   on,
   overlayConfigGet,
@@ -23,13 +28,17 @@ import {
   type Preferences,
   type PrefsPatch,
   permissionOf,
+  permissionProbeSystemAudio,
   permissionStatus,
   prefsGet,
   prefsSet,
+  type SystemAudioProbe,
+  type SystemSettingsPane,
   sessionClear,
   sessionStart,
   sessionStatus,
   sessionStop,
+  settingsOf,
   shortcutsGet,
   Theme,
   TranslateEngine,
@@ -40,6 +49,7 @@ import {
   updateRestart,
   ZhScript,
 } from '@/shared/ipc'
+import { initLocale } from '@/shared/locale'
 import { withTimeout } from '@/shared/timeout'
 import { type SessionInfo, SessionPhase, TaskStatus } from '@/shared/types'
 
@@ -51,12 +61,18 @@ interface Store {
   info: AppInfo | null
 
   prefsReady: boolean
+  devicesLoading: boolean
   audioSource: AudioSourceKind
   device: string
+  mixMicDevice: string
+  mixSystemDevice: string
   translateEngine: TranslateEngine
+  asrEngine: EngineType
   sourceLang: string
+  targetLang: string
   zhScript: ZhScript
   theme: Theme
+  language: Language
   endpoint: EndpointConfig
 
   status: TaskStatus
@@ -64,8 +80,12 @@ interface Store {
   refreshSession: () => Promise<void>
   activeDevice: string | null
   audio: AudioStatus | null
+  languageMismatch: boolean
+  setLanguageMismatch: (v: boolean) => void
 
   devices: InputDevice[]
+  mixMicDevices: InputDevice[]
+  mixSystemDevices: InputDevice[]
   deviceError: string | null
 
   overlayCfg: OverlayConfig | null
@@ -93,10 +113,16 @@ interface Store {
 
   permissions: PermissionSnapshot | null
   refreshPermission: () => Promise<void>
+  speechStatus: MacSpeechStatus | null
+  setSpeechStatus: (status: MacSpeechStatus | null) => void
+  refreshSpeechStatus: () => Promise<void>
+  systemAudioProbe: SystemAudioProbe | null
+  runSystemAudioProbe: () => Promise<SystemAudioProbe>
   permissionError: CmdPermissionError | null
   setPermissionError: (e: CmdPermissionError | null) => void
 
   error: string | null
+  errorSettingsPane: SystemSettingsPane | null
   setError: (e: string | null) => void
   pending: boolean
 
@@ -104,9 +130,14 @@ interface Store {
   clearAll: () => Promise<void>
   setAudioSource: (v: AudioSourceKind) => void
   setDevice: (v: string) => void
+  setMixMicDevice: (v: string) => void
+  setMixSystemDevice: (v: string) => void
   setTranslateEngine: (v: TranslateEngine) => void
-  setDirection: (lang: string, script: ZhScript) => void
+  setAsrEngine: (v: EngineType) => void
+  setEngineAndDirection: (engine: TranslateEngine, source: string, target: string, script: ZhScript) => void
+  setDirection: (source: string, target: string | ZhScript, script?: ZhScript) => void
   changeTheme: (v: Theme) => Promise<void>
+  changeLanguage: (v: Language) => Promise<void>
   setEndpoint: (v: EndpointConfig) => Promise<void>
   updateOverlay: (patch: Partial<OverlayConfig>) => Promise<void>
   toggleOverlay: () => Promise<void>
@@ -133,10 +164,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const [audioSource, setAudioSource] = useState<AudioSourceKind>(AudioSourceKind.Loopback)
   const [device, setDevice] = useState('')
+  const [mixMicDevice, setMixMicDevice] = useState('')
+  const [mixSystemDevice, setMixSystemDevice] = useState('')
   const [translateEngine, setTranslateEngine] = useState<TranslateEngine>(TranslateEngine.LocalNmt)
+  const [asrEngine, setAsrEngine] = useState<EngineType>(EngineType.LocalStreaming)
   const [sourceLang, setSourceLang] = useState('en')
+  const [targetLang, setTargetLang] = useState('zh')
   const [zhScript, setZhScript] = useState(ZhScript.Simplified)
   const [theme, setTheme] = useState<Theme>(Theme.System)
+  const [language, setLanguage] = useState<Language>(Language.System)
   const [endpoint, setEndpoint] = useState<EndpointConfig>({
     trailingSilenceMs: 800,
     maxUtteranceMs: 8000,
@@ -147,8 +183,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [activeDevice, setActiveDevice] = useState<string | null>(null)
   const [audio, setAudio] = useState<AudioStatus | null>(null)
   const sessionVersion = useRef(0)
+  const [languageMismatch, setLanguageMismatch] = useState(false)
 
   const [devices, setDevices] = useState<InputDevice[]>([])
+  const [mixMicDevices, setMixMicDevices] = useState<InputDevice[]>([])
+  const [mixSystemDevices, setMixSystemDevices] = useState<InputDevice[]>([])
+  const [devicesLoading, setDevicesLoading] = useState(false)
   const [deviceError, setDeviceError] = useState<string | null>(null)
 
   const [overlayCfg, setOverlayCfg] = useState<OverlayConfig | null>(null)
@@ -164,9 +204,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [onboardingDone, setOnboardingDone] = useState(false)
   const [analyticsEnabled, setAnalyticsEnabledState] = useState(false)
   const [permissions, setPermissions] = useState<PermissionSnapshot | null>(null)
+  const [speechStatus, setSpeechStatus] = useState<MacSpeechStatus | null>(null)
+  const [systemAudioProbe, setSystemAudioProbe] = useState<SystemAudioProbe | null>(null)
   const [permissionError, setPermissionError] = useState<CmdPermissionError | null>(null)
 
-  const [error, setError] = useState<string | null>(null)
+  const [errorState, setErrorState] = useState<{
+    message: string
+    settingsPane: SystemSettingsPane | null
+  } | null>(null)
+  const error = errorState?.message ?? null
+  const errorSettingsPane = errorState?.settingsPane ?? null
+  const setError = useCallback((message: string | null) => {
+    setErrorState(message === null ? null : { message, settingsPane: null })
+  }, [])
   const [pending, setPending] = useState(false)
   const pendingRef = useRef(false)
   const prefsQueue = useRef<Promise<void>>(Promise.resolve())
@@ -201,13 +251,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setOverlayCfg(config)
   }, [])
 
-  const applySession = useCallback((current: SessionInfo) => {
-    setSessionInfo(current)
-    setStatus(current.status)
-    setActiveDevice(current.device ?? null)
-    if (current.status !== TaskStatus.Capturing) setAudio(null)
-    if (current.error) setError(current.error)
-  }, [])
+  const applySession = useCallback(
+    (current: SessionInfo) => {
+      setSessionInfo(current)
+      setStatus(current.status)
+      setActiveDevice(current.device ?? null)
+      if (current.status !== TaskStatus.Capturing) setAudio(null)
+      if (current.error) setError(current.error)
+    },
+    [setError],
+  )
 
   const refreshSession = useCallback(async () => {
     const version = ++sessionVersion.current
@@ -220,12 +273,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setError(`读取会话状态失败：${formatCmdError(e)}`)
       }
     }
-  }, [applySession])
+  }, [applySession, setError])
 
   useEffect(() => {
     appInfo()
       .then(setInfo)
       .catch((e) => setError(formatCmdError(e)))
+    void initLocale()
     hotkeyFailures()
       .then(setHotkeyProblems)
       .catch(() => {})
@@ -249,6 +303,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setSessionInfo(null)
       if (s !== TaskStatus.Capturing) {
         setAudio(null)
+        setLanguageMismatch(false)
         setActiveDevice(null)
       }
       void refreshSession()
@@ -273,6 +328,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       .catch(reportError)
 
     on<AudioStatus>(EVENT.audio, setAudio).then(keep).catch(reportError)
+    on<boolean>(EVENT.languageMismatch, setLanguageMismatch).then(keep)
 
     on<OverlayConfig>(EVENT.overlayState, (config) => {
       if (!disposed) applyOverlay(config)
@@ -289,7 +345,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       sessionVersion.current++
       for (const fn of unlisten) fn()
     }
-  }, [applyOverlay, refreshSession])
+  }, [applyOverlay, refreshSession, setError])
 
   useEffect(() => {
     let disposed = false
@@ -298,13 +354,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (disposed) return
         setAudioSource(p.audioSource as AudioSourceKind)
         setTranslateEngine(p.translateEngine)
+        setAsrEngine(p.asrEngine)
         setSourceLang(p.sourceLang)
+        setTargetLang(p.targetLang)
         setZhScript(p.zhScript)
         setTheme(p.theme)
+        setLanguage(p.language)
         setEndpoint(p.endpoint)
         setOnboardingDone(p.onboardingDone)
         setAnalyticsEnabledState(p.analyticsEnabled)
         if (p.deviceId) setDevice(p.deviceId)
+        if (p.mixMicDeviceId) setMixMicDevice(p.mixMicDeviceId)
+        if (p.mixSystemDeviceId) setMixSystemDevice(p.mixSystemDeviceId)
       })
       .catch((e) => {
         if (!disposed) setError(`读取设置失败：${formatCmdError(e)}`)
@@ -329,7 +390,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     return () => {
       disposed = true
     }
-  }, [applyOverlay])
+  }, [applyOverlay, setError])
 
   useEffect(() => {
     setTrackingEnabled(prefsReady && analyticsEnabled && info?.analyticsAvailable === true)
@@ -343,12 +404,35 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  const refreshSpeechStatus = useCallback(async () => {
+    if (!info?.macSpeechSupported) {
+      setSpeechStatus(null)
+      return
+    }
+    try {
+      setSpeechStatus(await macSpeechStatus())
+    } catch {
+      setSpeechStatus(null)
+    }
+  }, [info?.macSpeechSupported])
+
+  const runSystemAudioProbe = useCallback(async () => {
+    const result = await permissionProbeSystemAudio()
+    setSystemAudioProbe(result)
+    return result
+  }, [])
+
   useEffect(() => {
     void refreshPermission()
-    const onFocus = () => void refreshPermission()
+    void refreshSpeechStatus()
+    const onFocus = () => {
+      void refreshPermission()
+      void refreshSpeechStatus()
+      setSystemAudioProbe(null)
+    }
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
-  }, [refreshPermission])
+  }, [refreshPermission, refreshSpeechStatus])
 
   const applyTheme = useCallback((pref: Theme) => {
     const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches
@@ -426,6 +510,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (patch.audioSource !== undefined) setAudioSource(p.audioSource as AudioSourceKind)
         if (patch.deviceId !== undefined) setDevice(p.deviceId ?? '')
         if (patch.translateEngine !== undefined) setTranslateEngine(p.translateEngine)
+        if (patch.asrEngine !== undefined) setAsrEngine(p.asrEngine)
+        if (patch.targetLang !== undefined) setTargetLang(p.targetLang)
+        if (patch.mixMicDeviceId !== undefined) setMixMicDevice(p.mixMicDeviceId ?? '')
+        if (patch.mixSystemDeviceId !== undefined) setMixSystemDevice(p.mixSystemDeviceId ?? '')
         if (patch.sourceLang !== undefined) setSourceLang(p.sourceLang)
         if (patch.zhScript !== undefined) setZhScript(p.zhScript)
         if (patch.theme !== undefined) setTheme(p.theme)
@@ -437,7 +525,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return false
       }
     },
-    [savePrefs],
+    [savePrefs, setError],
   )
 
   const completeOnboarding = useCallback(async () => {
@@ -451,7 +539,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       setError(formatCmdError(e))
     }
-  }, [savePrefs])
+  }, [savePrefs, setError])
 
   const setAnalyticsEnabled = useCallback(
     (next: boolean) => {
@@ -468,17 +556,46 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         })
         .catch((e) => setError(formatCmdError(e)))
     },
-    [info, savePrefs],
+    [info, savePrefs, setError],
   )
 
   const refreshDevices = useCallback(async () => {
+    setDevicesLoading(true)
+    const load = async (
+      source: AudioSourceKind,
+      label: string,
+      setList: (list: InputDevice[]) => void,
+      setSelected: (update: (cur: string) => string) => void,
+    ): Promise<string | null> => {
+      try {
+        const list = await audioDevices(source)
+        setList(list)
+        setSelected((cur) => cur || (list.find((d) => d.isDefault)?.id ?? ''))
+        return null
+      } catch (e) {
+        return t('common.labeledError', { label, error: formatCmdError(e) })
+      }
+    }
+
     try {
-      const list = await audioDevices(audioSource)
-      setDevices(list)
-      setDeviceError(null)
-      setDevice((cur) => cur || (list.find((d) => d.isDefault)?.id ?? ''))
+      if (audioSource === AudioSourceKind.Mix) {
+        const errors = (
+          await Promise.all([
+            load(AudioSourceKind.Mic, t('permissions.mic'), setMixMicDevices, setMixMicDevice),
+            load(AudioSourceKind.Loopback, t('audio.sourceLoopbackLabel'), setMixSystemDevices, setMixSystemDevice),
+          ])
+        ).filter((error): error is string => error !== null)
+        setDeviceError(errors.length > 0 ? errors.join('\n') : null)
+      } else {
+        const list = await audioDevices(audioSource)
+        setDevices(list)
+        setDeviceError(null)
+        setDevice((cur) => cur || (list.find((d) => d.isDefault)?.id ?? ''))
+      }
     } catch (e) {
       setDeviceError(formatCmdError(e))
+    } finally {
+      setDevicesLoading(false)
     }
   }, [audioSource])
 
@@ -518,9 +635,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         const saved = await prefsGet()
         await withTimeout(
           sessionStart(
-            saved.deviceId || undefined,
+            {
+              device: saved.deviceId || undefined,
+              mixMicDeviceId: saved.mixMicDeviceId || undefined,
+              mixSystemDeviceId: saved.mixSystemDeviceId || undefined,
+            },
             saved.translateEngine,
             saved.sourceLang,
+            saved.targetLang,
             saved.zhScript,
             saved.audioSource as AudioSourceKind,
           ),
@@ -536,14 +658,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setPermissionError(denied)
         void refreshPermission()
       } else {
-        setError(formatCmdError(e))
+        setErrorState({ message: formatCmdError(e), settingsPane: settingsOf(e)?.pane ?? null })
       }
       await refreshSession()
     } finally {
       pendingRef.current = false
       setPending(false)
     }
-  }, [status, sessionInfo, refreshPermission, refreshSession])
+  }, [status, sessionInfo, refreshPermission, refreshSession, setError])
 
   const clearAll = useCallback(async () => {
     await sessionClear()
@@ -577,7 +699,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       overlayQueue.current = request
       return request
     },
-    [applyOverlay],
+    [applyOverlay, setError],
   )
 
   const toggleOverlay = useCallback(async () => {
@@ -586,7 +708,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       setError(formatCmdError(e))
     }
-  }, [runSettingsWrite])
+  }, [runSettingsWrite, setError])
 
   const refreshHotkeys = useCallback(async () => {
     try {
@@ -595,7 +717,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       setError(formatCmdError(e))
     }
-  }, [])
+  }, [setError])
 
   const changeTheme = useCallback(
     async (next: Theme) => {
@@ -620,6 +742,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [patchPrefs],
   )
 
+  const changeMixMicDevice = useCallback(
+    (v: string) => {
+      setMixMicDevice(v)
+      void patchPrefs({ mixMicDeviceId: v })
+    },
+    [patchPrefs],
+  )
+
+  const changeMixSystemDevice = useCallback(
+    (v: string) => {
+      setMixSystemDevice(v)
+      void patchPrefs({ mixSystemDeviceId: v })
+    },
+    [patchPrefs],
+  )
+
   const changeTranslateEngine = useCallback(
     (v: TranslateEngine) => {
       void patchPrefs({ translateEngine: v }).then((saved) => {
@@ -629,10 +767,38 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [patchPrefs],
   )
 
+  const changeAsrEngine = useCallback(
+    (v: EngineType) => {
+      void patchPrefs({ asrEngine: v }).then((saved) => {
+        if (saved) track('setting_changed', { key: 'asr_engine', value: v })
+      })
+    },
+    [patchPrefs],
+  )
+
+  const changeEngineAndDirection = useCallback(
+    (engine: TranslateEngine, source: string, target: string, script: ZhScript) => {
+      void patchPrefs({ translateEngine: engine, sourceLang: source, targetLang: target, zhScript: script }).then(
+        (saved) => {
+          if (saved) {
+            track('setting_changed', { key: 'translate_engine', value: engine })
+            track('setting_changed', { key: 'translate_direction', value: `${source}:${target}:${script}` })
+          }
+        },
+      )
+    },
+    [patchPrefs],
+  )
+
   const changeDirection = useCallback(
-    (lang: string, script: ZhScript) => {
-      void patchPrefs({ sourceLang: lang, zhScript: script }).then((saved) => {
-        if (saved) track('setting_changed', { key: 'translate_direction', value: `${lang}:${script}` })
+    (source: string, target: string | ZhScript, script?: ZhScript) => {
+      const patch =
+        script === undefined
+          ? { sourceLang: source, zhScript: target as ZhScript }
+          : { sourceLang: source, targetLang: target, zhScript: script }
+      void patchPrefs(patch).then((saved) => {
+        if (saved)
+          track('setting_changed', { key: 'translate_direction', value: `${source}:${target}:${script ?? ''}` })
       })
     },
     [patchPrefs],
@@ -641,6 +807,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const changeEndpoint = useCallback(
     async (v: EndpointConfig) => {
       await patchPrefs({ endpoint: v })
+    },
+    [patchPrefs],
+  )
+
+  const changeLanguage = useCallback(
+    async (v: Language) => {
+      setLanguage(v)
+      await patchPrefs({ language: v })
+      track('setting_changed', { key: 'language', value: v })
     },
     [patchPrefs],
   )
@@ -760,7 +935,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       updateExclusiveRef.current = false
       setUpdateRestarting(false)
     }
-  }, [updatePhase, installedVersion, status, sessionInfo, flushSettings])
+  }, [updatePhase, installedVersion, status, sessionInfo, flushSettings, setError])
 
   const autoCheckedRef = useRef(false)
   useEffect(() => {
@@ -784,19 +959,29 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       restartApp,
       runSettingsWrite,
       prefsReady,
+      devicesLoading,
       audioSource,
       device,
+      mixMicDevice,
+      mixSystemDevice,
       translateEngine,
+      asrEngine,
       sourceLang,
+      targetLang,
       zhScript,
       theme,
+      language,
       endpoint,
       status,
       sessionInfo,
       refreshSession,
       activeDevice,
       audio,
+      languageMismatch,
+      setLanguageMismatch,
       devices,
+      mixMicDevices,
+      mixSystemDevices,
       deviceError,
       overlayCfg,
       overlayVisible,
@@ -808,18 +993,29 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setAnalyticsEnabled,
       permissions,
       refreshPermission,
+      speechStatus,
+      setSpeechStatus,
+      refreshSpeechStatus,
+      systemAudioProbe,
+      runSystemAudioProbe,
       permissionError,
       setPermissionError,
       error,
+      errorSettingsPane,
       setError,
       pending,
       toggleSession,
       clearAll,
       setAudioSource: changeAudioSource,
       setDevice: changeDevice,
+      setMixMicDevice: changeMixMicDevice,
+      setMixSystemDevice: changeMixSystemDevice,
       setTranslateEngine: changeTranslateEngine,
+      setAsrEngine: changeAsrEngine,
+      setEngineAndDirection: changeEngineAndDirection,
       setDirection: changeDirection,
       changeTheme,
+      changeLanguage,
       setEndpoint: changeEndpoint,
       updateOverlay,
       toggleOverlay,
@@ -839,19 +1035,28 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       restartApp,
       runSettingsWrite,
       prefsReady,
+      devicesLoading,
       audioSource,
       device,
+      mixMicDevice,
+      mixSystemDevice,
       translateEngine,
+      asrEngine,
       sourceLang,
+      targetLang,
       zhScript,
       theme,
+      language,
       endpoint,
       status,
       sessionInfo,
       refreshSession,
       activeDevice,
       audio,
+      languageMismatch,
       devices,
+      mixMicDevices,
+      mixSystemDevices,
       deviceError,
       overlayCfg,
       overlayVisible,
@@ -863,16 +1068,27 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setAnalyticsEnabled,
       permissions,
       refreshPermission,
+      speechStatus,
+      refreshSpeechStatus,
+      systemAudioProbe,
+      runSystemAudioProbe,
       permissionError,
       error,
+      errorSettingsPane,
+      setError,
       pending,
       toggleSession,
       clearAll,
       changeAudioSource,
       changeDevice,
+      changeMixMicDevice,
+      changeMixSystemDevice,
       changeTranslateEngine,
+      changeAsrEngine,
+      changeEngineAndDirection,
       changeDirection,
       changeTheme,
+      changeLanguage,
       changeEndpoint,
       updateOverlay,
       toggleOverlay,

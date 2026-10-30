@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process'
-import { copyFile, existsSync } from 'node:fs'
-import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { createReadStream } from 'node:fs'
+import { mkdir, readdir, rm, stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -15,19 +16,23 @@ const PYTHON = IS_WIN ? 'python' : 'python3'
 const PY = join(VENV_BIN, IS_WIN ? 'python.exe' : 'python')
 const TOK_CACHE = join(ROOT, '.cache', 'mt')
 
-const argv = process.argv.slice(2)
-const argValue = (name) => {
-  const i = argv.indexOf(name)
-  return i >= 0 ? argv[i + 1] : undefined
+const force = process.argv.includes('--force')
+const multilingual = process.argv.includes('--multilingual')
+const lmtFast = process.argv.includes('--lmt-fast')
+const lmtHigh = process.argv.includes('--lmt-high')
+
+const MT_DIR = join(ROOT, 'src-tauri', 'assets', 'models', 'mt')
+const NLLB_HF = 'facebook/nllb-200-distilled-600M'
+const NLLB_DIR_NAME = 'nllb-200-distilled-600M-ct2-int8'
+const NLLB_ROOT = join(ROOT, '.cache', 'mt-nllb')
+const NLLB_URL = `https://github.com/niyongsheng/AudioScript/releases/download/models-v1/${NLLB_DIR_NAME}.tar.gz`
+
+const LMT_SOURCES = {
+  fast: { hf: 'NiuTrans/LMT-60-0.6B', dirName: 'lmt-60-0.6B-ct2-int8' },
+  high: { hf: 'NiuTrans/LMT-60-1.7B', dirName: 'lmt-60-1.7B-ct2-int8' },
 }
-const big = argValue('--tier') === 'big'
-const printCatalog = argv.includes('--print-catalog')
-const force = argv.includes('--force')
 
-const MT_DIR = big ? join(ROOT, '.cache', 'mt-big-build') : join(ROOT, 'src-tauri', 'assets', 'models', 'mt')
-const DIST_DIR = join(ROOT, 'dist', 'models', 'models-v1')
-
-const BASE_PAIRS = [
+const PAIRS = [
   {
     hf: 'Helsinki-NLP/opus-mt-en-zh',
     dir: 'opus-mt-en-zh-ct2',
@@ -41,25 +46,6 @@ const BASE_PAIRS = [
     note: 'zh→en (CC-BY-4.0，需署名)',
   },
 ]
-
-const BIG_PAIRS = [
-  {
-    hf: 'Helsinki-NLP/opus-mt-tc-big-en-zh',
-    candidates: ['Helsinki-NLP/opus-mt-tc-big-en-zh', 'Helsinki-NLP/opus-mt-tc-big-en-zho'],
-    dir: 'opus-mt-tc-big-en-zh-ct2',
-    tokenizer: 'tok-tc-big-en-zh',
-    note: 'en→zh tc-big (CC-BY-4.0)',
-  },
-  {
-    hf: 'Helsinki-NLP/opus-mt-tc-big-zh-en',
-    candidates: ['Helsinki-NLP/opus-mt-tc-big-zh-en', 'Helsinki-NLP/opus-mt-tc-big-zho-en'],
-    dir: 'opus-mt-tc-big-zh-en-ct2',
-    tokenizer: 'tok-tc-big-zh-en',
-    note: 'zh→en tc-big (CC-BY-4.0)',
-  },
-]
-
-const PAIRS = big ? BIG_PAIRS : BASE_PAIRS
 
 const SPM_TO_JSON_SCRIPT = `
 import sys, os, sentencepiece
@@ -87,72 +73,15 @@ async function dirSize(dir) {
   return total
 }
 
-async function sha256File(path) {
-  const { createHash } = await import('node:crypto')
-  const { createReadStream } = await import('node:fs')
-  return new Promise((resolvePromise, reject) => {
-    const hash = createHash('sha256')
-    createReadStream(path)
-      .on('data', (chunk) => hash.update(chunk))
-      .on('error', reject)
-      .on('end', () => resolvePromise(hash.digest('hex')))
-  })
-}
-
-async function resolveHf(pair) {
-  if (!pair.candidates) return pair.hf
-  const endpoint = (process.env.HF_ENDPOINT || 'https://huggingface.co').replace(/\/$/, '')
-  for (const id of pair.candidates) {
-    try {
-      const res = await fetch(`${endpoint}/api/models/${id}`)
-      if (res.ok) {
-        process.stdout.write(`🔎 ${pair.note} → ${id}\n`)
-        return id
-      }
-    } catch {
-    }
+async function hasFiles(dir, files) {
+  for (const f of files) {
+    if (!(await exists(join(dir, f)))) return false
   }
-  throw new Error(`找不到 tc-big 仓库：${pair.candidates.join(' / ')}（检查网络/HF 访问）`)
-}
-
-async function packBig() {
-  const notice = [
-    'These model weights come from the Helsinki-NLP / OPUS-MT project (CC-BY-4.0).',
-    'AudioScript converts them to CTranslate2 int8 and converts the SentencePiece',
-    'vocabularies to tokenizer JSON. Training data is unchanged.',
-    '',
-    'Source: https://huggingface.co/Helsinki-NLP',
-    'License: https://creativecommons.org/licenses/by/4.0/',
-    '',
-  ].join('\n')
-
-  for (const pair of PAIRS) {
-    await writeFile(join(MT_DIR, pair.dir, 'NOTICE.txt'), notice)
-  }
-
-  await mkdir(DIST_DIR, { recursive: true })
-  const archive = join(DIST_DIR, 'opus-mt-tc-big-en-zh-zh-en-ct2-int8.tar.gz')
-  await rm(archive, { force: true })
-  process.stdout.write(`📦 打包 ${archive}\n`)
-  run('tar', ['-czf', archive, '-C', MT_DIR, '.'])
-
-  const sha = await sha256File(archive)
-  const size = (await stat(archive)).size
-  const installed = await dirSize(MT_DIR)
-  const fragment = { id: 'mt-big', sha256: sha, sizeBytes: size, installedBytes: installed }
-  if (printCatalog) {
-    process.stdout.write(`\nCATALOG_FRAGMENT\n${JSON.stringify(fragment, null, 2)}\n`)
-  } else {
-    process.stdout.write(`sha256=${sha}\nsizeBytes=${size}\ninstalledBytes=${installed}\n`)
-  }
+  return true
 }
 
 async function isReady(dir) {
-  return (
-    (await exists(join(dir, 'model.bin'))) &&
-    (await exists(join(dir, 'source-tokenizer.json'))) &&
-    (await exists(join(dir, 'target-tokenizer.json')))
-  )
+  return hasFiles(dir, ['model.bin', 'source-tokenizer.json', 'target-tokenizer.json'])
 }
 
 function run(cmd, args, opts = {}) {
@@ -246,16 +175,119 @@ async function convert(pair) {
   process.stdout.write(`✅ ${pair.note} 完成（${(size / 1024 / 1024).toFixed(0)} MB）\n`)
 }
 
-async function main() {
-  process.stdout.write(
-    `${big ? '可选大模型' : '内置'}机器翻译模型（opus-mt + CTranslate2 int8）\n\n`,
-  )
-  if (big) {
-    await rm(MT_DIR, { recursive: true, force: true })
-    for (const pair of PAIRS) {
-      pair.hf = await resolveHf(pair)
+async function sha256File(path) {
+  const hash = createHash('sha256')
+  for await (const chunk of createReadStream(path)) hash.update(chunk)
+  return hash.digest('hex')
+}
+
+async function convertAndPackage({ hf, root, dirName, url, label, required, copyFiles }) {
+  const out = join(root, dirName)
+  const archive = join(ROOT, '.cache', `${dirName}.tar.gz`)
+  const complete = (dir) => hasFiles(dir, required)
+
+  if (force || !(await complete(out))) {
+    await ensureVenv()
+    await mkdir(root, { recursive: true })
+    await rm(out, { recursive: true, force: true })
+    process.stdout.write(`⬇️  转换 ${hf}（下载 fp32 权重 + 转 int8，首次较久）…\n`)
+    run(join(VENV_BIN, IS_WIN ? 'ct2-transformers-converter.exe' : 'ct2-transformers-converter'), [
+      '--model',
+      hf,
+      '--output_dir',
+      out,
+      '--quantization',
+      'int8',
+      '--copy_files',
+      ...copyFiles,
+      '--force',
+    ])
+    if (!(await complete(out))) {
+      throw new Error(`转换后仍缺文件：${out}`)
     }
   }
+
+  const installed = await dirSize(out)
+  process.stdout.write(`📦 打包 ${archive}\n`)
+  run('tar', ['-C', root, '-czf', archive, dirName])
+  const archiveSize = (await stat(archive)).size
+  const sha = await sha256File(archive)
+
+  process.stdout.write(`\n✅ ${label} 完成（安装后 ${(installed / 1024 / 1024).toFixed(0)} MB）\n`)
+  process.stdout.write(
+    [
+      '',
+      '上传到 GitHub Release：',
+      `  gh release upload models-v1 ${archive}`,
+      `  # release 不存在时：gh release create models-v1 ${archive} --title "Models v1" --notes "可选模型资源"`,
+      '',
+      'catalog 字段：',
+      JSON.stringify(
+        {
+          archive: {
+            url,
+            format: 'tar-gz',
+            sha256: sha,
+            sizeBytes: archiveSize,
+            maxExtractedBytes: Math.ceil(installed * 1.1),
+          },
+          sizes: { installedBytes: installed },
+        },
+        null,
+        2,
+      ),
+      '',
+    ].join('\n'),
+  )
+}
+
+async function convertMultilingual() {
+  await convertAndPackage({
+    hf: NLLB_HF,
+    root: NLLB_ROOT,
+    dirName: NLLB_DIR_NAME,
+    url: NLLB_URL,
+    label: 'NLLB',
+    required: ['model.bin', 'shared_vocabulary.json', 'config.json', 'tokenizer.json'],
+    copyFiles: ['tokenizer.json', 'special_tokens_map.json'],
+  })
+}
+
+async function convertLmt(kind) {
+  const spec = LMT_SOURCES[kind]
+  await convertAndPackage({
+    hf: spec.hf,
+    root: join(ROOT, '.cache', `mt-${spec.dirName}`),
+    dirName: spec.dirName,
+    url: `https://github.com/niyongsheng/AudioScript/releases/download/models-v1/${spec.dirName}.tar.gz`,
+    label: `LMT-${kind}`,
+    required: ['model.bin', 'tokenizer.json', 'config.json', 'vocabulary.json'],
+    copyFiles: [
+      'tokenizer.json',
+      'tokenizer_config.json',
+      'chat_template.jinja',
+      'generation_config.json',
+      'special_tokens_map.json',
+      'added_tokens.json',
+    ],
+  })
+}
+
+async function main() {
+  if (lmtFast || lmtHigh) {
+    process.stdout.write('多语言机器翻译模型（NiuTrans LMT-60 + CTranslate2 int8）\n\n')
+    if (lmtFast) await convertLmt('fast')
+    if (lmtHigh) await convertLmt('high')
+    return
+  }
+
+  if (multilingual) {
+    process.stdout.write('多语言机器翻译模型（NLLB-200 + CTranslate2 int8）\n\n')
+    await convertMultilingual()
+    return
+  }
+
+  process.stdout.write('内置机器翻译模型（opus-mt + CTranslate2 int8）\n\n')
 
   for (const pair of PAIRS) {
     await convert(pair)
@@ -271,10 +303,6 @@ async function main() {
 
   const total = await dirSize(MT_DIR)
   process.stdout.write(`\n✅ 翻译模型全部就绪，合计 ${(total / 1024 / 1024).toFixed(0)} MB\n`)
-
-  if (big) {
-    await packBig()
-  }
 }
 
 main().catch((e) => {

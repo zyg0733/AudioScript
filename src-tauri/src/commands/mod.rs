@@ -1,48 +1,14 @@
-use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::config::{
-    direction_label, target_lang_for, EndpointConfig, EndpointProfile, OverlayConfig, OverlayMode,
-    Preferences, PrefsPatch, SessionConfig, TranslateEngine,
+    direction_label, effective_target_lang, EndpointConfig, EndpointProfile, OverlayConfig,
+    OverlayMode, Preferences, PrefsPatch, SessionConfig, TranslateEngine,
 };
-use crate::{audio, overlay, permission, prefs, session, shortcut, update};
-
-#[derive(Debug, thiserror::Error)]
-pub enum CmdError {
-    #[error("未知命令：{0}")]
-    Unknown(String),
-
-    #[error("参数无效：{0}")]
-    BadArgs(String),
-
-    #[error("{message}")]
-    Permission {
-        permission: &'static str,
-        message: String,
-    },
-
-    #[error("{0}")]
-    Failed(String),
-}
-
-impl Serialize for CmdError {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Permission {
-                permission,
-                message,
-            } => json!({
-                "kind": "permission",
-                "permission": permission,
-                "message": message,
-            })
-            .serialize(s),
-            other => s.serialize_str(&other.to_string()),
-        }
-    }
-}
+pub use crate::error::CmdError;
+use crate::i18n::{tf, tr, Key};
+use crate::{audio, monitor, overlay, permission, prefs, session, shortcut, update};
 
 #[tauri::command]
 pub async fn dispatch(app: AppHandle, name: String, args: Value) -> Result<Value, CmdError> {
@@ -71,7 +37,7 @@ where
         .spawn(move || {
             let _ = tx.send(task());
         })
-        .map_err(|e| CmdError::Failed(format!("启动后台线程失败：{e}")))?;
+        .map_err(|e| CmdError::Failed(tf(Key::CmdThreadStartFailed, &[&e.to_string()])))?;
 
     await_task(rx, timeout).await
 }
@@ -82,8 +48,8 @@ async fn await_task<R>(
 ) -> Result<R, CmdError> {
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(_)) => Err(CmdError::Failed("后台任务异常退出".into())),
-        Err(_) => Err(CmdError::Failed("后台任务超时，请重试".into())),
+        Ok(Err(_)) => Err(CmdError::Failed(tr(Key::CmdTaskPanicked).into())),
+        Err(_) => Err(CmdError::Failed(tr(Key::CmdTimeout).into())),
     }
 }
 
@@ -150,7 +116,7 @@ where
         .send(Box::new(move || {
             let _ = tx.send(task());
         }))
-        .map_err(|_| CmdError::Failed("命令执行线程已退出".into()))?;
+        .map_err(|_| CmdError::Failed(tr(Key::CmdLaneExited).into()))?;
 
     await_task(rx, timeout).await
 }
@@ -183,10 +149,16 @@ pub async fn route_async(app: &AppHandle, name: &str, args: &Value) -> Result<Va
         {
             Some((Lane::Quick, std::time::Duration::from_secs(120)))
         }
+        "monitor_start" => Some((Lane::Session, std::time::Duration::from_secs(90))),
+        "monitor_stop" => Some((Lane::Session, std::time::Duration::from_secs(15))),
         "permission_probe_system_audio" => Some((Lane::Quick, std::time::Duration::from_secs(30))),
         "permission_request_mic" => Some((Lane::Quick, std::time::Duration::from_secs(40))),
         "models_list" => Some((Lane::Quick, std::time::Duration::from_secs(10))),
+        "mac_translation_languages" => Some((Lane::Quick, std::time::Duration::from_secs(10))),
+        "mac_speech_status" => Some((Lane::Quick, std::time::Duration::from_secs(20))),
+        "mac_speech_request" => Some((Lane::Quick, std::time::Duration::from_secs(30))),
         "model_remove" => Some((Lane::Quick, std::time::Duration::from_secs(60))),
+        "model_dir_set" => Some((Lane::Quick, std::time::Duration::from_secs(20))),
         _ => None,
     };
 
@@ -227,6 +199,23 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdErro
                 .map_err(CmdError::Failed)
         }
         "app_info" => Ok(app_info()),
+        "mac_translation_languages" => mac_translation_languages(),
+        "mac_speech_status" => {
+            let status = crate::asr::mac_native::status();
+            tracing::info!(
+                availability = crate::asr::mac_native::available(),
+                authorization = %status.authorization,
+                installed = ?status.installed_locales,
+                "macOS 系统语音状态"
+            );
+            Ok(json!(status))
+        }
+        "mac_speech_request" => {
+            let code = crate::asr::mac_native::request_authorization(20_000);
+            tracing::info!(authorization = code, "macOS 系统语音授权请求完成");
+            Ok(json!(crate::asr::mac_native::status()))
+        }
+        "locale_get" => Ok(json!(crate::i18n::locale().as_str())),
 
         "update_restart" => {
             let state = app.state::<session::SessionState>();
@@ -240,7 +229,7 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdErro
         "overlay_set_mode" => {
             let raw = str_arg(args, "mode")?;
             let mode = OverlayMode::parse(raw)
-                .ok_or_else(|| CmdError::BadArgs(format!("未知模式 {raw}")))?;
+                .ok_or_else(|| CmdError::BadArgs(tf(Key::CmdUnknownMode, &[raw])))?;
             overlay::set_mode(app, mode)
                 .map(|m| json!(m.as_str()))
                 .map_err(CmdError::Failed)
@@ -262,16 +251,16 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdErro
                 return Err(CmdError::BadArgs(crate::telemetry::DISABLED_REASON.into()));
             }
 
-            prefs::update(app, |p| patch.apply_to(p))
-                .map(|p| json!(p))
-                .map_err(CmdError::Failed)
+            let updated = prefs::update(app, |p| patch.apply_to(p)).map_err(CmdError::Failed)?;
+            crate::apply_language(app, updated.language);
+            Ok(json!(updated))
         }
 
         "prefs_reset" => {
             let fresh = Preferences::default();
-            prefs::update(app, |p| *p = fresh.clone())
-                .map(|_| json!(fresh))
-                .map_err(CmdError::Failed)
+            let updated = prefs::update(app, |p| *p = fresh).map_err(CmdError::Failed)?;
+            crate::apply_language(app, updated.language);
+            Ok(json!(updated))
         }
 
         "permission_status" => Ok(json!(permission::snapshot())),
@@ -282,18 +271,19 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdErro
 
         "permission_probe_system_audio" => {
             if app.state::<session::SessionState>().is_running() {
-                return Err(CmdError::Failed("正在转写中，请先停止再检测".into()));
+                return Err(CmdError::Failed(tr(Key::CmdProbeWhileCapturing).into()));
             }
+            monitor::stop(app);
             Ok(json!(permission::probe_system_audio(app)))
         }
 
-        "open_privacy_settings" => {
+        "open_system_settings" => {
             let pane = args
                 .get("pane")
                 .and_then(Value::as_str)
                 .unwrap_or("systemAudio");
             let url = permission::settings_url(pane)
-                .ok_or_else(|| CmdError::BadArgs(format!("未知设置页 {pane}")))?;
+                .ok_or_else(|| CmdError::BadArgs(tf(Key::CmdUnknownPane, &[pane])))?;
             #[cfg(target_os = "macos")]
             if let Err(e) = std::process::Command::new("open").arg(url).spawn() {
                 tracing::warn!(pane, "无法直接打开系统设置页（URI scheme 可能已变更）：{e}");
@@ -302,27 +292,21 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdErro
         }
 
         "open_repo" => {
-            open_with_system(
-                std::ffi::OsStr::new(&crate::project::links().repository),
-                "浏览器",
-            )?;
+            open_with_system(std::ffi::OsStr::new(&crate::project::links().repository), tr(Key::OpenWhatBrowser))?;
             Ok(json!(null))
         }
 
         "open_sponsor" => {
-            open_with_system(
-                std::ffi::OsStr::new(&crate::project::links().upstream_sponsor),
-                "浏览器",
-            )?;
+            open_with_system(std::ffi::OsStr::new(&crate::project::links().upstream_sponsor), tr(Key::OpenWhatBrowser))?;
             Ok(json!(null))
         }
 
         "open_url" => {
             let url = str_arg(args, "url")?;
             if !is_allowed_link(url) {
-                return Err(CmdError::BadArgs(format!("拒绝打开非项目链接：{url}")));
+                return Err(CmdError::BadArgs(tf(Key::CmdLinkRejected, &[url])));
             }
-            open_with_system(std::ffi::OsStr::new(url), "链接")?;
+            open_with_system(std::ffi::OsStr::new(url), tr(Key::OpenWhatLink))?;
             Ok(json!(null))
         }
 
@@ -360,14 +344,14 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdErro
             let on = args
                 .get("enabled")
                 .and_then(Value::as_bool)
-                .ok_or_else(|| CmdError::BadArgs("缺少 enabled".into()))?;
+                .ok_or_else(|| CmdError::BadArgs(tr(Key::CmdMissingEnabled).into()))?;
 
             let r = if on {
                 app.autolaunch().enable()
             } else {
                 app.autolaunch().disable()
             };
-            r.map_err(|e| CmdError::Failed(format!("设置开机自启失败：{e}")))?;
+            r.map_err(|e| CmdError::Failed(tf(Key::CmdAutostartFailed, &[&e.to_string()])))?;
 
             Ok(json!({
                 "enabled": app.autolaunch().is_enabled().unwrap_or(false),
@@ -378,8 +362,13 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdErro
 
         "model_open_dir" => {
             let dir = crate::paths::ensure_user_models_root(app).map_err(CmdError::Failed)?;
-            open_with_system(dir.as_os_str(), "模型目录")?;
+            open_with_system(dir.as_os_str(), tr(Key::OpenWhatModelDir))?;
             Ok(json!(null))
+        }
+
+        "model_dir_set" => {
+            let path = args.get("path").and_then(Value::as_str);
+            Ok(json!(set_model_dir(app, path)?))
         }
 
         "model_download" => {
@@ -437,19 +426,62 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdErro
                 .map_err(|e| CmdError::Failed(e.to_string()))
         }
 
+        "monitor_start" => {
+            let targets = args
+                .get("targets")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            let source = item
+                                .get("source")
+                                .and_then(Value::as_str)
+                                .and_then(audio::AudioSourceKind::parse)?;
+                            let device = item.get("device").and_then(Value::as_str);
+                            Some(monitor::Target::new(source, device))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for target in &targets {
+                if let Some(permission) = permission::certain_denial(target.source) {
+                    return Err(CmdError::Permission {
+                        permission,
+                        message: tr(Key::CmdMicDenied).into(),
+                    });
+                }
+            }
+            monitor::start(app, &targets).map_err(|e| match e {
+                monitor::MonitorError::Audio(audio::AudioError::Permission {
+                    permission,
+                    message,
+                }) => CmdError::Permission {
+                    permission,
+                    message,
+                },
+                other => CmdError::Failed(other.to_string()),
+            })?;
+            Ok(json!(null))
+        }
+
+        "monitor_stop" => {
+            monitor::stop(app);
+            Ok(json!(null))
+        }
+
         "session_start" => {
             let cfg: SessionConfig = args
                 .get("config")
                 .map(|v| serde_json::from_value(v.clone()))
                 .transpose()
-                .map_err(|e| CmdError::BadArgs(format!("config 解析失败：{e}")))?
+                .map_err(|e| CmdError::BadArgs(tf(Key::CmdConfigParseFailed, &[&e.to_string()])))?
                 .unwrap_or_default();
 
             let device = args
                 .get("device")
                 .and_then(Value::as_str)
-                .map(str::to_owned)
-                .filter(|s| !s.is_empty());
+                .map(str::to_owned);
 
             let source = args
                 .get("source")
@@ -457,12 +489,36 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdErro
                 .and_then(audio::AudioSourceKind::parse)
                 .unwrap_or_default();
 
+            let mix_mic = args
+                .get("mixMicDeviceId")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let mix_system = args
+                .get("mixSystemDeviceId")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let devices = if source == audio::AudioSourceKind::Mix {
+                audio::DeviceSelection::mix(mix_mic, mix_system)
+            } else {
+                audio::DeviceSelection::single(device)
+            };
+
             let mut cfg = cfg;
-            cfg.asr.endpoint = prefs::load(app).endpoint.sanitized();
+            let prefs = prefs::load(app);
+            cfg.asr.engine_type = prefs.asr_engine;
+            cfg.asr.source_lang = cfg.translate.source_lang.clone();
+            cfg.asr.endpoint = prefs.endpoint.sanitized();
+            cfg.translate.mt_model_tier = prefs.mt_model_tier;
 
             tracing::info!(
+                asr_engine = cfg.asr.engine_type.as_str(),
                 source_lang = %cfg.translate.source_lang,
-                target_lang = %target_lang_for(&cfg.translate.source_lang),
+                target_lang = %effective_target_lang(
+                    cfg.translate.engine,
+                    cfg.translate.mt_model_tier,
+                    &cfg.translate.source_lang,
+                    &cfg.translate.target_lang
+                ),
                 zh_script = cfg.translate.zh_script.as_str(),
                 engine = cfg.translate.engine.as_str(),
                 trailing_silence_ms = cfg.asr.endpoint.trailing_silence_ms,
@@ -470,33 +526,41 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdErro
                 "会话配置已解析（缺省字段已用默认值补齐）"
             );
 
-            let device_for_prefs = device.clone();
-
             if let Some(permission) = permission::certain_denial(source) {
                 return Err(CmdError::Permission {
                     permission,
-                    message:
-                        "麦克风权限已被拒绝，系统不会再弹窗。请到「权限」页打开系统设置重新允许。"
-                            .into(),
+                    message: tr(Key::CmdMicDenied).into(),
                 });
             }
 
-            match session::start(app, cfg, source, device) {
+            monitor::suspend(app);
+            match session::start(app, cfg, source, devices.clone()) {
                 Ok(()) => {
-                    if let Err(e) =
-                        prefs::update(app, |p| p.apply_session(source.as_str(), device_for_prefs))
-                    {
+                    let saved = prefs::update(app, |p| {
+                        p.apply_session(source.as_str(), devices.device.clone());
+                        if source == audio::AudioSourceKind::Mix {
+                            p.apply_mix_devices(
+                                devices.mix_mic.clone(),
+                                devices.mix_system.clone(),
+                            );
+                        }
+                    });
+                    if let Err(e) = saved {
                         tracing::error!("偏好保存失败，本次设置不会被记住：{e}");
                     }
                     Ok(json!(session::TaskStatus::Capturing))
                 }
-                Err(msg) => match permission::certain_denial(source) {
-                    Some(permission) => Err(CmdError::Permission {
-                        permission,
-                        message: msg,
-                    }),
-                    None => Err(CmdError::Failed(msg)),
-                },
+                Err(e) => {
+                    let handle = app.clone();
+                    if let Err(error) = enqueue_session(move || monitor::resume(&handle)) { tracing::warn!(%error, "恢复音频预览失败"); }
+                    match permission::certain_denial(source) {
+                        Some(permission) => Err(CmdError::Permission {
+                            permission,
+                            message: e.to_string(),
+                        }),
+                        None => Err(e),
+                    }
+                }
             }
         }
         "session_stop" => session::stop(app)
@@ -532,15 +596,15 @@ pub fn route(app: &AppHandle, name: &str, args: &Value) -> Result<Value, CmdErro
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, CmdError> {
     args.get(key)
         .and_then(Value::as_str)
-        .ok_or_else(|| CmdError::BadArgs(format!("缺少 {key}")))
+        .ok_or_else(|| CmdError::BadArgs(tf(Key::CmdMissingArg, &[key])))
 }
 
 fn json_arg<T: serde::de::DeserializeOwned>(args: &Value, key: &str) -> Result<T, CmdError> {
     let value = args
         .get(key)
-        .ok_or_else(|| CmdError::BadArgs(format!("缺少 {key}")))?;
+        .ok_or_else(|| CmdError::BadArgs(tf(Key::CmdMissingArg, &[key])))?;
     serde_json::from_value(value.clone())
-        .map_err(|e| CmdError::BadArgs(format!("{key} 解析失败：{e}")))
+        .map_err(|e| CmdError::BadArgs(tf(Key::CmdArgParseFailed, &[key, &e.to_string()])))
 }
 
 fn app_info() -> Value {
@@ -549,6 +613,8 @@ fn app_info() -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
+        "osVersion": os_version(),
+        "macSpeechSupported": crate::asr::mac_native::available() == crate::asr::mac_native::AVAILABLE,
         "builtAtMs": exe_mtime_ms(),
         "analyticsAvailable": crate::telemetry::app_key().is_some(),
         "analyticsDisabledReason": crate::telemetry::app_key().is_none().then_some(crate::telemetry::DISABLED_REASON),
@@ -558,11 +624,78 @@ fn app_info() -> Value {
     })
 }
 
+fn mac_translation_languages() -> Result<Value, CmdError> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::OnceLock;
+        use translation::LanguageAvailability;
+
+        static CACHE: OnceLock<Vec<String>> = OnceLock::new();
+        if let Some(languages) = CACHE.get() {
+            return Ok(json!(languages));
+        }
+
+        let availability =
+            LanguageAvailability::new().map_err(|e| CmdError::Failed(e.to_string()))?;
+        let languages = availability
+            .supported_languages()
+            .map_err(|e| CmdError::Failed(e.to_string()))?;
+        let languages = CACHE.get_or_init(|| languages);
+        Ok(json!(languages))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(json!([]))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn os_version() -> Option<String> {
+    let name = b"kern.osproductversion\0";
+    let mut size = 0usize;
+    let first = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr().cast(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if first != 0 || size == 0 {
+        return None;
+    }
+
+    let mut buffer = vec![0u8; size];
+    let second = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr().cast(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if second != 0 {
+        return None;
+    }
+
+    let end = buffer.iter().position(|b| *b == 0).unwrap_or(buffer.len());
+    String::from_utf8(buffer[..end].to_vec()).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn os_version() -> Option<String> {
+    None
+}
+
+
+
 fn export_dir(app: &AppHandle) -> Result<std::path::PathBuf, CmdError> {
     app.path()
         .desktop_dir()
         .or_else(|_| app.path().home_dir())
-        .map_err(|e| CmdError::Failed(format!("找不到可写入的位置：{e}")))
+        .map_err(|e| CmdError::Failed(tf(Key::CmdNoWritableDir, &[&e.to_string()])))
 }
 
 fn export_transcript(
@@ -577,7 +710,7 @@ fn export_transcript(
     let p = prefs::load(app);
     let direction = match p.translate_engine {
         TranslateEngine::Off => None,
-        _ => Some(direction_label(&p.source_lang, p.zh_script)),
+        _ => Some(direction_label(&p.source_lang, &p.target_lang, p.zh_script)),
     };
 
     let mut file = dest.to_path_buf();
@@ -585,9 +718,13 @@ fn export_transcript(
         file.set_extension("md");
     }
 
-    let md = crate::transcript::to_markdown(&segments, stamp, direction);
-    std::fs::write(&file, md)
-        .map_err(|e| CmdError::Failed(format!("写入 {} 失败：{e}", file.display())))?;
+    let md = crate::transcript::to_markdown(&segments, stamp, direction.as_deref());
+    std::fs::write(&file, md).map_err(|e| {
+        CmdError::Failed(tf(
+            Key::CmdWriteFailed,
+            &[&file.display().to_string(), &e.to_string()],
+        ))
+    })?;
 
     tracing::info!(path = %file.display(), "转写已导出");
     Ok(file)
@@ -628,19 +765,22 @@ fn open_with_system(target: &std::ffi::OsStr, what: &str) -> Result<(), CmdError
     cmd.arg(target)
         .spawn()
         .map(|_| ())
-        .map_err(|e| CmdError::Failed(format!("无法打开{what}：{e}")))
+        .map_err(|e| CmdError::Failed(tf(Key::CmdOpenFailed, &[what, &e.to_string()])))
 }
 
 fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), CmdError> {
     if !path.exists() {
-        return Err(CmdError::Failed(format!("路径不存在：{}", path.display())));
+        return Err(CmdError::Failed(tf(
+            Key::CmdPathMissing,
+            &[&path.display().to_string()],
+        )));
     }
-    open_with_system(path.as_os_str(), "文件管理器")
+    open_with_system(path.as_os_str(), tr(Key::OpenWhatFileManager))
 }
 
 fn export_logs(app: &AppHandle, src: &std::path::Path) -> Result<std::path::PathBuf, CmdError> {
     let stamp = newest_log_stamp(src).unwrap_or_else(|| "unknown".into());
-    let dest = export_dir(app)?.join(format!("AudioScript-日志-{stamp}"));
+    let dest = export_dir(app)?.join(tf(Key::CmdLogsFolderName, &[&stamp]));
     let files = copy_logs(src, &dest)?;
 
     tracing::info!(from = %src.display(), to = %dest.display(), files, "日志已导出");
@@ -648,11 +788,15 @@ fn export_logs(app: &AppHandle, src: &std::path::Path) -> Result<std::path::Path
 }
 
 fn copy_logs(src: &std::path::Path, dest: &std::path::Path) -> Result<usize, CmdError> {
-    std::fs::create_dir_all(dest)
-        .map_err(|e| CmdError::Failed(format!("创建 {} 失败：{e}", dest.display())))?;
+    std::fs::create_dir_all(dest).map_err(|e| {
+        CmdError::Failed(tf(
+            Key::CmdCreateDirFailed,
+            &[&dest.display().to_string(), &e.to_string()],
+        ))
+    })?;
 
-    let entries =
-        std::fs::read_dir(src).map_err(|e| CmdError::Failed(format!("读取日志目录失败：{e}")))?;
+    let entries = std::fs::read_dir(src)
+        .map_err(|e| CmdError::Failed(tf(Key::CmdReadLogDirFailed, &[&e.to_string()])))?;
 
     let mut copied = 0usize;
     for entry in entries.flatten() {
@@ -661,15 +805,19 @@ fn copy_logs(src: &std::path::Path, dest: &std::path::Path) -> Result<usize, Cmd
             continue;
         }
         let Some(name) = p.file_name() else { continue };
-        std::fs::copy(&p, dest.join(name))
-            .map_err(|e| CmdError::Failed(format!("复制 {} 失败：{e}", p.display())))?;
+        std::fs::copy(&p, dest.join(name)).map_err(|e| {
+            CmdError::Failed(tf(
+                Key::CmdCopyFailed,
+                &[&p.display().to_string(), &e.to_string()],
+            ))
+        })?;
         copied += 1;
     }
 
     if copied == 0 {
-        return Err(CmdError::Failed(format!(
-            "{} 中没有日志文件，无可导出",
-            src.display()
+        return Err(CmdError::Failed(tf(
+            Key::CmdNoLogs,
+            &[&src.display().to_string()],
         )));
     }
     Ok(copied)
@@ -705,10 +853,10 @@ fn model_cmd_error(e: crate::models::ModelError) -> CmdError {
 }
 
 fn select_model(app: &AppHandle, id: &str) -> Result<crate::models::status::ModelsList, CmdError> {
-    use crate::config::{AsrModelTier, MtModelTier};
+    use crate::config::AsrModelTier;
 
     let entry = crate::models::catalog::entry(id)
-        .ok_or_else(|| CmdError::BadArgs(format!("未知模型：{id}")))?;
+        .ok_or_else(|| CmdError::BadArgs(tf(Key::CmdUnknownModel, &[id])))?;
 
     let mut list = crate::models::status::inspect(app);
     let complete = list
@@ -717,26 +865,26 @@ fn select_model(app: &AppHandle, id: &str) -> Result<crate::models::status::Mode
         .chain(list.mt.iter())
         .find(|m| m.id == id)
         .map(|m| m.complete)
-        .ok_or_else(|| CmdError::BadArgs(format!("未知模型：{id}")))?;
+        .ok_or_else(|| CmdError::BadArgs(tf(Key::CmdUnknownModel, &[id])))?;
     if !complete {
-        return Err(CmdError::BadArgs(format!(
-            "模型「{}」尚未安装或文件不完整，请先下载",
-            entry.title
+        return Err(CmdError::BadArgs(tf(
+            Key::CmdModelNotReady,
+            &[&entry.localized_title()],
         )));
     }
 
     match entry.kind {
         crate::models::ModelKind::Asr => {
             let tier = AsrModelTier::parse(&entry.tier)
-                .ok_or_else(|| CmdError::BadArgs(format!("未知 ASR 档位：{}", entry.tier)))?;
+                .ok_or_else(|| CmdError::BadArgs(tf(Key::CmdUnknownAsrTier, &[&entry.tier])))?;
             crate::prefs::update(app, |p| p.asr_model_tier = tier).map_err(CmdError::Failed)?;
             for m in &mut list.asr {
                 m.selected = m.id == id;
             }
         }
         crate::models::ModelKind::Mt => {
-            let tier = MtModelTier::parse(&entry.tier)
-                .ok_or_else(|| CmdError::BadArgs(format!("未知 MT 档位：{}", entry.tier)))?;
+            let tier = crate::config::MtModelTier::parse(&entry.tier)
+                .ok_or_else(|| CmdError::BadArgs(tf(Key::CmdUnknownMtTier, &[&entry.tier])))?;
             crate::prefs::update(app, |p| p.mt_model_tier = tier).map_err(CmdError::Failed)?;
             for m in &mut list.mt {
                 m.selected = m.id == id;
@@ -746,6 +894,34 @@ fn select_model(app: &AppHandle, id: &str) -> Result<crate::models::status::Mode
 
     tracing::info!(model = %entry.id, "已切换模型（下次开始转写生效）");
     Ok(list)
+}
+
+fn set_model_dir(
+    app: &AppHandle,
+    raw: Option<&str>,
+) -> Result<crate::models::status::ModelsList, CmdError> {
+    if app.state::<crate::models::state::ModelState>().is_busy() {
+        return Err(CmdError::Failed(tr(Key::PathCustomDirBusy).into()));
+    }
+
+    let models_dir = match raw {
+        Some(value) => Some(
+            crate::paths::validate_models_dir(app, value)
+                .map_err(CmdError::Failed)?
+                .display()
+                .to_string(),
+        ),
+        None => None,
+    };
+
+    crate::prefs::update(app, |p| p.models_dir = models_dir.clone()).map_err(CmdError::Failed)?;
+
+    match &models_dir {
+        Some(dir) => tracing::info!(dir = %dir, "模型存储位置已更新"),
+        None => tracing::info!("模型存储位置已恢复默认"),
+    }
+
+    Ok(crate::models::status::inspect(app))
 }
 
 fn exe_mtime_ms() -> Option<u64> {
@@ -760,6 +936,18 @@ fn exe_mtime_ms() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reports_the_macos_product_version() {
+        let version = os_version().expect("macOS 必须能读到 kern.osproductversion");
+        let major = version
+            .split('.')
+            .next()
+            .and_then(|v| v.parse::<u32>().ok())
+            .expect("版本号格式应为 major.minor.patch");
+        assert!(major >= 10, "{version}");
+    }
 
     fn tmp(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("audioscript-logs-{tag}-{}", std::process::id()));
@@ -833,7 +1021,7 @@ mod tests {
             "https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models"
         ));
         assert!(is_allowed_link(
-            "https://huggingface.co/Helsinki-NLP/opus-mt-tc-big-en-zh"
+            "https://huggingface.co/Helsinki-NLP/opus-mt-en-zh"
         ));
         assert!(is_allowed_link(
             "https://creativecommons.org/licenses/by/4.0/"

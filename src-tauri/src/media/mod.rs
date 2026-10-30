@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
-use crate::asr::streaming::StreamingAdapter;
+use crate::asr::{streaming::StreamingAdapter, AsrEngine};
 use crate::config::{target_lang_for, AsrConfig, TranslateConfig};
 use crate::library::{LibraryRecord, LibrarySource, LibrarySourceKind, LibraryState, Repository};
 use crate::transcript::TranscriptSegment;
@@ -723,8 +723,17 @@ fn execute(shared: &Mutex<Shared>, task: &Task) -> Result<(), String> {
             source_lang: task.options.source_lang.clone(),
             ..Default::default()
         };
+        let entry = crate::models::catalog::asr_entry(prefs.asr_model_tier);
+        let mut engine: Box<dyn AsrEngine> = match entry.asr_format() {
+            Some(crate::models::catalog::AsrFormat::Transducer) => Box::new(StreamingAdapter::new(entry)),
+            Some(crate::models::catalog::AsrFormat::Qwen3Asr) => {
+                let vad = crate::paths::vad_model_path(&roots).ok_or("缺少 VAD 模型")?;
+                Box::new(crate::asr::offline::Qwen3OfflineAdapter::new(vad, entry))
+            }
+            None => return Err("所选识别模型不受支持".into()),
+        };
         worker::recognize(
-            &mut StreamingAdapter::new(),
+            engine.as_mut(),
             &config,
             Path::new(task.source.pcm_path.as_deref().ok_or("缺少保留音频")?),
             &task.cancel,
@@ -743,13 +752,24 @@ fn execute(shared: &Mutex<Shared>, task: &Task) -> Result<(), String> {
             zh_script: prefs.zh_script,
             ..Default::default()
         };
-        let translator = crate::paths::locate_mt_root(&roots, prefs.mt_model_tier).map(|model| {
-            config.model_dir = Some(model.path.to_string_lossy().into_owned());
-            LocalNmt::new(model.path, prefs.mt_model_tier)
-        });
-        worker::translate_prepared(translator, &config, &mut segments, &task.cancel, |p| {
-            progress(shared, &task.job_id, "translating", 71.0 + p * 25.0)
-        })?
+        config.mt_model_tier = prefs.mt_model_tier;
+        let entry = crate::models::catalog::mt_entry(prefs.mt_model_tier);
+        let model = crate::paths::locate_mt_root(&roots, entry);
+        match entry.mt_format() {
+            Some(crate::models::catalog::MtFormat::Marian) => worker::translate_prepared(
+                model.map(|model| LocalNmt::new(model.path)), &config, &mut segments, &task.cancel,
+                |p| progress(shared, &task.job_id, "translating", 71.0 + p * 25.0),
+            )?,
+            Some(crate::models::catalog::MtFormat::Nllb) => worker::translate_prepared(
+                model.map(|model| crate::translate::nllb::NllbTranslator::new(model.path)), &config, &mut segments, &task.cancel,
+                |p| progress(shared, &task.job_id, "translating", 71.0 + p * 25.0),
+            )?,
+            Some(crate::models::catalog::MtFormat::Lmt) => worker::translate_prepared(
+                model.map(|model| crate::translate::lmt::LmtTranslator::new(model.path, prefs.mt_model_tier)), &config, &mut segments, &task.cancel,
+                |p| progress(shared, &task.job_id, "translating", 71.0 + p * 25.0),
+            )?,
+            None => return Err("所选翻译模型不受支持".into()),
+        }
     } else {
         0
     };

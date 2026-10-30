@@ -16,9 +16,12 @@ assert.equal(config.plugins.updater.pubkey, '', '源码不得内置上游或其�
 assert.equal(config.bundle.createUpdaterArtifacts, false, '普通构建默认不生成更新工件')
 assert.equal(config.plugins.updater.requireSignedVersion, true, '更新签名必须绑定清单版本')
 assert.equal(config.identifier, 'io.github.zyg0733.audioscript', 'fork 应用标识不能与上游共用')
-assert.equal(catalog.models.find((model) => model.id === 'mt-big').archive.url.startsWith(`${project.modelsRelease}/`), true)
+for (const model of catalog.models.filter((entry) => entry.downloadable)) {
+  assert.equal(new URL(model.archive.url).protocol, 'https:', `模型 ${model.id} 的下载地址必须使用 HTTPS`)
+  assert.match(model.archive.sha256, /^[0-9a-f]{64}$/, `模型 ${model.id} 必须固定校验和`)
+}
 
-for (const path of ['README.md', 'docs/index.html']) {
+for (const path of ['README.md', 'README.zh-CN.md', 'docs/index.html']) {
   const source = read(path)
   assert.equal(source.includes(`${project.repository}/releases/latest`), true, `${path} 缺少 fork 下载入口`)
   assert.equal(source.includes(project.site), true, `${path} 的官网链接未更新`)

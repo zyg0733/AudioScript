@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 
 use crate::config::Preferences;
+use crate::i18n::{tf, Key};
 
 const FILE_NAME: &str = "preferences.json";
 
@@ -11,7 +12,7 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_config_dir()
-        .map_err(|e| format!("无法解析配置目录：{e}"))?;
+        .map_err(|e| tf(Key::PrefsNoConfigDir, &[&e.to_string()]))?;
     Ok(dir.join(FILE_NAME))
 }
 
@@ -90,15 +91,15 @@ pub fn save_to(path: &Path, prefs: &Preferences) -> Result<(), String> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| format!("{} 没有父目录，无法创建", path.display()))?;
+        .ok_or_else(|| tf(Key::PrefsNoParent, &[&path.display().to_string()]))?;
 
-    std::fs::create_dir_all(dir).map_err(|e| format!("创建配置目录失败：{e}"))?;
+    std::fs::create_dir_all(dir).map_err(|e| tf(Key::PrefsCreateDirFailed, &[&e.to_string()]))?;
 
-    let json = to_json(prefs).map_err(|e| format!("偏好序列化失败：{e}"))?;
+    let json = to_json(prefs).map_err(|e| tf(Key::PrefsSerializeFailed, &[&e.to_string()]))?;
 
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json).map_err(|e| format!("写入临时偏好文件失败：{e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("替换偏好文件失败：{e}"))?;
+    std::fs::write(&tmp, &json).map_err(|e| tf(Key::PrefsWriteTempFailed, &[&e.to_string()]))?;
+    std::fs::rename(&tmp, path).map_err(|e| tf(Key::PrefsReplaceFailed, &[&e.to_string()]))?;
 
     tracing::debug!(path = %path.display(), "偏好已保存");
     Ok(())
@@ -128,6 +129,17 @@ mod tests {
     }
 
     #[test]
+    fn models_dir_is_trimmed_and_blank_becomes_none() {
+        let p = parse(r#"{"modelsDir":" /Volumes/Data/models "}"#).unwrap();
+        assert_eq!(p.models_dir.as_deref(), Some("/Volumes/Data/models"));
+        assert_eq!(
+            parse(r#"{"modelsDir":"   "}"#).unwrap().models_dir,
+            None,
+            "空白路径必须回落到默认目录"
+        );
+    }
+
+    #[test]
     fn unknown_enum_value_fails_that_file_not_silently() {
         assert!(parse(r#"{"translateEngine":"gpt-5"}"#).is_err());
     }
@@ -144,7 +156,9 @@ mod tests {
             audio_source: "mix".into(),
             device_id: Some("dev-42".into()),
             translate_engine: TranslateEngine::Off,
+            asr_engine: crate::config::EngineType::LocalStreaming,
             source_lang: "zh".into(),
+            target_lang: "en".into(),
             ..Default::default()
         };
         let json = to_json(&p).unwrap();
@@ -154,7 +168,7 @@ mod tests {
     #[test]
     fn source_lang_derivation_survives_roundtrip() {
         let p = parse(r#"{"sourceLang":"zh"}"#).unwrap();
-        assert_eq!(p.target_lang(), "en");
+        assert_eq!(p.target_lang, "en");
     }
 
     fn temp_path(tag: &str) -> PathBuf {
@@ -169,8 +183,13 @@ mod tests {
         let p = Preferences {
             audio_source: "mix".into(),
             device_id: Some("device-7".into()),
+            mix_mic_device_id: Some("mic-3".into()),
+            mix_system_device_id: Some("out-4".into()),
             translate_engine: TranslateEngine::Off,
+            asr_engine: crate::config::EngineType::LocalStreaming,
+            mt_model_tier: crate::config::MtModelTier::default(),
             source_lang: "zh".into(),
+            target_lang: "en".into(),
             overlay: crate::config::OverlayConfig {
                 opacity: 33,
                 font_size: 40,
@@ -185,6 +204,7 @@ mod tests {
                 },
             }),
             theme: crate::config::Theme::Dark,
+            language: crate::config::Language::Ja,
             sidebar_visible: false,
             endpoint: crate::config::EndpointConfig {
                 trailing_silence_ms: 600,
@@ -198,7 +218,7 @@ mod tests {
             .collect(),
             onboarding_done: true,
             asr_model_tier: crate::config::AsrModelTier::HighAccuracy,
-            mt_model_tier: crate::config::MtModelTier::Big,
+            models_dir: Some("/Volumes/Data/AudioScript".into()),
             zh_script: crate::config::ZhScript::Traditional,
             analytics_enabled: false,
         };
@@ -240,6 +260,7 @@ mod tests {
             device_id: None,
             translate_engine: TranslateEngine::Mock,
             source_lang: "zh".into(),
+            target_lang: "en".into(),
             ..Default::default()
         };
 

@@ -1,4 +1,7 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { hotkeyLabel } from '@/shared/hotkeys'
+import { useI18n } from '@/shared/i18n'
+import { openSystemSettings } from '@/shared/ipc'
 import { TaskStatus } from '@/shared/types'
 import { Alert } from '@/ui/Alert'
 import { Button } from '@/ui/Button'
@@ -7,18 +10,19 @@ import { PrimaryAction } from '@/ui/PrimaryAction'
 import { Sidebar } from '@/ui/Sidebar'
 import { TitleBarSpacer } from '@/ui/TitleBarSpacer'
 import { Brand } from './Brand'
-import { NAV, type PageId } from './navigation'
+import { navItems, type PageId } from './navigation'
 import { AboutPage } from './pages/AboutPage'
 import { AudioPage } from './pages/AudioPage'
 import { GeneralPage } from './pages/GeneralPage'
 import { LibraryPage } from './pages/LibraryPage'
 import { ModelsPage } from './pages/ModelsPage'
 import { OverlayPage } from './pages/OverlayPage'
-import { PermissionsPage } from './pages/PermissionsPage'
 import { TranscribePage } from './pages/TranscribePage'
 import { TranslatePage } from './pages/TranslatePage'
 import { StoreProvider, useStore } from './store'
+import { UpdateToast } from './UpdateToast'
 import { WelcomeGate } from './WelcomeGate'
+import { SEEN_VERSION_KEY, WhatsNew, type WhatsNewFeature, whatsNewFor } from './WhatsNew'
 
 export function App() {
   return (
@@ -29,10 +33,44 @@ export function App() {
 }
 
 function Root() {
-  const { prefsReady, onboardingDone } = useStore()
+  const { info, prefsReady, onboardingDone } = useStore()
+  const [whatsNew, setWhatsNew] = useState<readonly WhatsNewFeature[] | null>(null)
+
+  const closeWhatsNew = useCallback(() => {
+    if (!info) return
+    localStorage.setItem(SEEN_VERSION_KEY, info.version)
+    setWhatsNew(null)
+  }, [info])
+
+  useEffect(() => {
+    if (!prefsReady || !info) return
+
+    const seen = localStorage.getItem(SEEN_VERSION_KEY)
+    if (seen === info.version) return
+
+    const features = whatsNewFor(info.version)
+    if (!seen && !onboardingDone) {
+      localStorage.setItem(SEEN_VERSION_KEY, info.version)
+      return
+    }
+    if (features) {
+      setWhatsNew(features)
+    } else {
+      localStorage.setItem(SEEN_VERSION_KEY, info.version)
+    }
+  }, [prefsReady, info, onboardingDone])
 
   if (!prefsReady) return <BootSplash />
-  return onboardingDone ? <Shell /> : <WelcomeGate />
+  if (!onboardingDone) return <WelcomeGate />
+
+  return (
+    <>
+      <Shell />
+      {whatsNew && info && (
+        <WhatsNew version={info.version} name={info.name} features={whatsNew} onClose={closeWhatsNew} />
+      )}
+    </>
+  )
 }
 
 function BootSplash() {
@@ -52,17 +90,27 @@ function Shell() {
   const [page, setPage] = useState<PageId>('transcribe')
   const [recordId, setRecordId] = useState<string | undefined>()
   const { status, updatePhase, updateRestarting } = useStore()
+  const [focusPermissions, setFocusPermissions] = useState(false)
+  const { locale } = useI18n()
+  // biome-ignore lint/correctness/useExhaustiveDependencies: t() 读取模块级 locale，需要随 locale 重算
+  const items = useMemo(() => navItems(), [locale])
   const capturing = status === TaskStatus.Capturing
   const updating = updatePhase === 'downloading' || updateRestarting
 
+  const openPermissions = useCallback(() => {
+    setPage('general')
+    setFocusPermissions(true)
+  }, [])
+  const handlePermissionsFocused = useCallback(() => setFocusPermissions(false), [])
+
   return (
     <main className="flex h-full">
-      <Sidebar items={NAV} current={page} onNavigate={setPage} brand={<Brand />} header={<PrimaryActionSlot />} />
+      <Sidebar items={items} current={page} onNavigate={setPage} brand={<Brand />} header={<PrimaryActionSlot />} />
 
       <section className="flex min-w-0 flex-1 flex-col bg-[var(--color-surface-0)]">
         <TitleBarSpacer />
 
-        <Alerts page={page} onOpenPermissions={() => setPage('permissions')} onOpenAbout={() => setPage('about')} />
+        <Alerts onOpenPermissions={openPermissions} onOpenTranslate={() => setPage('translate')} />
 
         <div className="flex-1 overflow-y-auto">
           <fieldset disabled={updating} className="m-0 min-w-0 border-0 p-0">
@@ -73,7 +121,9 @@ function Shell() {
                 setRecordId(id)
                 setPage('library')
               }}
-              onOpenPermissions={() => setPage('permissions')}
+              onOpenPermissions={openPermissions}
+              focusPermissions={focusPermissions}
+              onFocusPermissionsHandled={handlePermissionsFocused}
             />
           </fieldset>
         </div>
@@ -84,6 +134,8 @@ function Shell() {
           </div>
         </footer>
       </section>
+
+      <UpdateToast hidden={page === 'about'} />
     </main>
   )
 }
@@ -115,9 +167,18 @@ interface PageSwitchProps {
   onOpenLibrary: (id: string) => void
   page: PageId
   onOpenPermissions: () => void
+  focusPermissions: boolean
+  onFocusPermissionsHandled: () => void
 }
 
-function PageSwitch({ page, recordId, onOpenLibrary, onOpenPermissions }: PageSwitchProps) {
+function PageSwitch({
+  page,
+  recordId,
+  onOpenLibrary,
+  onOpenPermissions,
+  focusPermissions,
+  onFocusPermissionsHandled,
+}: PageSwitchProps) {
   switch (page) {
     case 'transcribe':
       return <TranscribePage onOpenLibrary={onOpenLibrary} />
@@ -125,14 +186,12 @@ function PageSwitch({ page, recordId, onOpenLibrary, onOpenPermissions }: PageSw
       return <LibraryPage initialRecordId={recordId} />
     case 'audio':
       return <AudioPage onOpenPermissions={onOpenPermissions} />
-    case 'permissions':
-      return <PermissionsPage />
     case 'translate':
       return <TranslatePage />
     case 'overlay':
       return <OverlayPage />
     case 'general':
-      return <GeneralPage />
+      return <GeneralPage focusPermissions={focusPermissions} onFocusPermissionsHandled={onFocusPermissionsHandled} />
     case 'models':
       return <ModelsPage />
     case 'about':
@@ -141,29 +200,45 @@ function PageSwitch({ page, recordId, onOpenLibrary, onOpenPermissions }: PageSw
 }
 
 interface AlertsProps {
-  page: PageId
   onOpenPermissions: () => void
-  onOpenAbout: () => void
+  onOpenTranslate: () => void
 }
 
-function Alerts({ page, onOpenPermissions, onOpenAbout }: AlertsProps) {
+function Alerts({ onOpenPermissions, onOpenTranslate }: AlertsProps) {
+  const { t } = useI18n()
   const {
     error,
     sessionInfo,
     refreshSession,
+    errorSettingsPane,
     setError,
     hotkeyProblems,
     audio,
+    languageMismatch,
+    setLanguageMismatch,
     status,
     permissionError,
     setPermissionError,
-    updateInfo,
     updatePhase,
     updateRestarting,
   } = useStore()
 
+  const showMismatch = languageMismatch && status === TaskStatus.Capturing
+  const showSilent = Boolean(audio?.silent && audio.segments === 0 && status === TaskStatus.Capturing)
+  const hasAlerts =
+    !sessionInfo ||
+    updatePhase === 'downloading' ||
+    updateRestarting ||
+    Boolean(error) ||
+    Boolean(permissionError) ||
+    showMismatch ||
+    hotkeyProblems.length > 0 ||
+    showSilent
+
+  if (!hasAlerts) return null
+
   return (
-    <>
+    <div className="mx-auto w-full max-w-2xl space-y-2 px-6 pt-4">
       {!sessionInfo && (
         <Alert tone="info" title="会话状态尚未同步">
           <Button size="sm" onClick={() => void refreshSession()}>
@@ -176,49 +251,68 @@ function Alerts({ page, onOpenPermissions, onOpenAbout }: AlertsProps) {
           请等待安装或重启完成。
         </Alert>
       )}
-      {updateInfo?.available && page !== 'about' && updatePhase !== 'downloading' && updatePhase !== 'ready' && (
-        <Alert tone="info" title={`发现新版本 v${updateInfo.version ?? ''}`}>
-          <Button size="sm" onClick={onOpenAbout}>
-            去「关于」页更新
-          </Button>
-        </Alert>
-      )}
-
       {error && (
-        <Alert tone="error" title="操作失败">
-          <p className="font-mono">{error}</p>
-          <button type="button" onClick={() => setError(null)} className="mt-1 underline opacity-70 hover:opacity-100">
-            关闭
+        <Alert
+          tone="error"
+          title={t('app.operationFailed')}
+          onDismiss={() => setError(null)}
+          actions={
+            errorSettingsPane && (
+              <Button size="sm" onClick={() => void openSystemSettings(errorSettingsPane).catch(() => {})}>
+                {t('translate.languagePackOpen')}
+              </Button>
+            )
+          }
+        >
+          <p className="break-words font-mono">{error}</p>
+          <button type="button" onClick={() => setError(null)}>
+            {t('common.close')}
           </button>
         </Alert>
       )}
 
       {permissionError && (
-        <Alert tone="warn" title="缺少系统权限">
-          <p>{permissionError.message}</p>
-          <div className="mt-1.5 flex gap-1.5">
+        <Alert
+          tone="warn"
+          title={t('app.permissionMissing')}
+          onDismiss={() => setPermissionError(null)}
+          actions={
             <Button size="sm" onClick={onOpenPermissions}>
-              去「权限」页处理
+              {t('app.permissionGo')}
             </Button>
-            <Button size="sm" variant="ghost" onClick={() => setPermissionError(null)}>
-              关闭
+          }
+        >
+          <p>{permissionError.message}</p>
+        </Alert>
+      )}
+
+      {showMismatch && (
+        <Alert
+          tone="warn"
+          title={t('app.languageMismatch')}
+          onDismiss={() => setLanguageMismatch(false)}
+          actions={
+            <Button size="sm" onClick={onOpenTranslate}>
+              {t('app.languageMismatchGo')}
             </Button>
-          </div>
+          }
+        >
+          {t('app.languageMismatchDetail')}
         </Alert>
       )}
 
       {hotkeyProblems.length > 0 && (
-        <Alert tone="warn" title={`${hotkeyProblems.length} 个全局热键注册失败`}>
-          {hotkeyProblems.map((h) => `${h.accelerator} ${h.label}`).join('、')}
-          。悬浮窗将无法用热键操作，请在「悬浮窗」页重新绑定。
+        <Alert tone="warn" title={t('app.hotkeyFailed', { count: hotkeyProblems.length })}>
+          {hotkeyProblems.map((h) => `${h.accelerator} ${hotkeyLabel(h.id, t)}`).join(t('common.listSeparator'))}
+          {t('app.hotkeyFailedDetail')}
         </Alert>
       )}
 
-      {audio?.silent && audio.segments === 0 && status === TaskStatus.Capturing && (
-        <Alert tone="warn" title="收不到声音（电平 ≈ 0）">
-          到「音频」页查看排查步骤。
+      {showSilent && (
+        <Alert tone="warn" title={t('app.audioSilent')}>
+          {t('app.audioSilentDetail')}
         </Alert>
       )}
-    </>
+    </div>
   )
 }

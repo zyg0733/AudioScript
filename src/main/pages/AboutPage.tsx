@@ -1,12 +1,18 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '@/main/store'
-import { formatCmdError, type ModelsList, modelsList, openRepo, openUrl } from '@/shared/ipc'
+import { useI18n } from '@/shared/i18n'
+import { formatCmdError, type ModelsList, modelsList, openRepo, openSponsor, openUrl } from '@/shared/ipc'
+import { modelTitle } from '@/shared/models'
 import { ModelKind, SessionPhase, TaskStatus } from '@/shared/types'
 import { Button } from '@/ui/Button'
 import { Icon } from '@/ui/Icon'
 import { Page } from '@/ui/Page'
 import { ProgressBar } from '@/ui/ProgressBar'
 import { SettingsGroup, SettingsRow } from '@/ui/Settings'
+
+function afdianBadge(label: string): string {
+  return `https://img.shields.io/badge/${encodeURIComponent(label)}-Afdian-946ce6?style=for-the-badge&logo=github&logoColor=white`
+}
 
 export function AboutPage() {
   const {
@@ -25,6 +31,7 @@ export function AboutPage() {
     installUpdate,
     restartApp,
   } = useStore()
+  const { t } = useI18n()
   const [models, setModels] = useState<ModelsList | null>(null)
   const [modelsFailed, setModelsFailed] = useState(false)
   const [licensesOpen, setLicensesOpen] = useState(false)
@@ -42,6 +49,14 @@ export function AboutPage() {
       disposed = true
     }
   }, [])
+
+  async function openSponsorPage() {
+    try {
+      await openSponsor()
+    } catch (e) {
+      setError(formatCmdError(e))
+    }
+  }
 
   async function openSite() {
     if (!info) return
@@ -79,7 +94,10 @@ export function AboutPage() {
       return updateInfo?.disabledReason ?? info.updaterDisabledReason ?? '自动更新已禁用'
     }
     if (updatePhase === 'downloading') {
-      return `正在下载并安装 v${updateInfo?.version ?? ''}${percent == null ? '' : `（${percent}%）`}…`
+      const version = updateInfo?.version ?? ''
+      return percent == null
+        ? t('about.updateDownloading', { version })
+        : t('about.updateDownloadingPercent', { version, percent })
     }
     if (updatePhase === 'ready') {
       const version = installedVersion ?? updateInfo?.version ?? ''
@@ -87,23 +105,25 @@ export function AboutPage() {
       if (!sessionInfo) return `已安装 v${version}，确认会话状态后可重启`
       return sessionBusy ? `已安装 v${version}，请等待转写收尾完成后再重启` : `已安装 v${version}，重启应用后生效`
     }
-    if (updatePhase === 'error') return `更新失败：${updateError ?? '未知错误'}`
-    if (updatePhase === 'checking') return '正在检查最新版本…'
+    if (updatePhase === 'error') {
+      return t('about.updateError', { error: updateError ?? t('about.unknownError') })
+    }
+    if (updatePhase === 'checking') return t('about.updateChecking')
     if (updateInfo?.available) {
       if (!sessionInfo) return '发现新版本，确认会话状态后可更新'
       return capturing ? '发现新版本，请先停止转写再更新' : `发现新版本 v${updateInfo.version}`
     }
-    if (updateInfo) return `已是最新版本（v${updateInfo.currentVersion}）`
-    return '启动时自动检查，也可手动检查'
+    if (updateInfo) return t('about.updateLatest', { version: updateInfo.currentVersion })
+    return t('about.updateIdle')
   })()
 
   return (
-    <Page title="关于">
-      <SettingsGroup title="应用程序">
-        <SettingsRow icon="info" title="版本" control={<Mono>{info?.version ?? '—'}</Mono>} />
+    <Page title={t('about.title')}>
+      <SettingsGroup title={t('about.appGroup')}>
+        <SettingsRow icon="info" title={t('about.version')} control={<Mono>{info?.version ?? '—'}</Mono>} />
         <SettingsRow
           icon="download"
-          title="检查更新"
+          title={t('about.checkUpdate')}
           description={
             <>
               {updateDescription}
@@ -115,8 +135,8 @@ export function AboutPage() {
           control={
             updatePhase === 'downloading' ? (
               <div className="flex items-center gap-2">
-                <ProgressBar value={percent} label="更新下载进度" />
-                <Mono>{percent == null ? '下载中' : `${percent}%`}</Mono>
+                <ProgressBar value={percent} label={t('about.updateProgress')} />
+                <Mono>{percent == null ? t('about.downloading') : `${percent}%`}</Mono>
               </div>
             ) : updatePhase === 'ready' ? (
               <Button
@@ -137,7 +157,7 @@ export function AboutPage() {
                 onClick={() => void installUpdate()}
                 disabled={!updaterEnabled || sessionBusy || updatePhase === 'checking'}
               >
-                下载并安装
+                {t('common.downloadAndInstall')}
               </Button>
             ) : (
               <Button
@@ -147,14 +167,14 @@ export function AboutPage() {
                 disabled={!updaterEnabled || updatePhase === 'checking'}
                 pending={updatePhase === 'checking'}
               >
-                检查
+                {t('common.check')}
               </Button>
             )
           }
         />
         <SettingsRow
           icon="chip"
-          title="平台"
+          title={t('about.platform')}
           control={
             <Mono>
               {info?.platform ?? '—'} · {info?.arch ?? '—'}
@@ -170,13 +190,23 @@ export function AboutPage() {
         />
         <SettingsRow
           icon="external"
-          title="官网"
+          title={t('about.website')}
           onClick={() => void openSite()}
-          control={<Icon name="chevron" size={16} className="mt-0.5 text-[var(--color-ink-2)]" />}
+          control={<Icon name="chevron" size={16} className="mt-0.5 text-[var(--color-ink-2)] rtl:rotate-180" />}
         />
       </SettingsGroup>
 
-      <SettingsGroup title="开源许可">
+      <SettingsGroup title={t('about.support')}>
+        <SettingsRow
+          icon="heart"
+          title={t('about.sponsor')}
+          description={t('about.sponsorDescription')}
+          onClick={() => void openSponsorPage()}
+          control={<img src={afdianBadge(t('about.afdian'))} alt={t('about.afdian')} className="h-7 w-auto" />}
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title={t('about.licensesGroup')}>
         <SettingsRow
           icon="github"
           title={
@@ -190,17 +220,10 @@ export function AboutPage() {
         />
       </SettingsGroup>
 
-      <SettingsGroup
-        title="模型与许可"
-        footer={
-          licensesOpen
-            ? '本项目把 OPUS-MT 权重转换为 CTranslate2 int8，并把 SentencePiece 词表转换为 tokenizer JSON；未更改训练数据。'
-            : undefined
-        }
-      >
+      <SettingsGroup title={t('about.modelsLicenses')} footer={licensesOpen ? t('about.licenseFooter') : undefined}>
         <SettingsRow
           icon="shield"
-          title="模型许可"
+          title={t('about.modelLicense')}
           onClick={() => setLicensesOpen((open) => !open)}
           control={
             <Icon
@@ -220,8 +243,8 @@ export function AboutPage() {
                   title={l.component}
                   description={
                     <>
-                      {m.title} · {l.license}
-                      {l.requiresAttribution && ' · 需署名'}
+                      {modelTitle(m, t)} · {l.license}
+                      {l.requiresAttribution && t('about.needsAttribution')}
                       {l.attribution && ` · ${l.attribution}`}
                     </>
                   }
@@ -233,7 +256,7 @@ export function AboutPage() {
                         icon="external"
                         onClick={() => void openUrl(l.licenseUrl as string).catch((e) => setError(formatCmdError(e)))}
                       >
-                        许可
+                        {t('about.licenseButton')}
                       </Button>
                     ) : undefined
                   }
@@ -241,7 +264,7 @@ export function AboutPage() {
               )),
             )
           ) : (
-            <SettingsRow title={modelsFailed ? '模型许可读取失败，请到「模型」页重试' : '读取中…'} />
+            <SettingsRow title={modelsFailed ? t('about.licenseLoadFailed') : t('common.loading')} />
           ))}
       </SettingsGroup>
     </Page>

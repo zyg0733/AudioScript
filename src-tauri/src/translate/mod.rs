@@ -1,28 +1,40 @@
+pub mod lmt;
 pub mod local_nmt;
+#[cfg(target_os = "macos")]
+pub mod mac_translation;
 pub mod mock;
+pub mod nllb;
 pub mod queue;
 pub mod script;
 
-use crate::config::TranslateConfig;
+use std::path::Path;
+
+use ct2rs::tokenizers::hf::Tokenizer as HfTokenizer;
+
+use crate::config::{base_lang, TranslateConfig, ZhScript};
+use crate::i18n::{tf, tr, Key};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TranslateError {
-    #[error("翻译引擎未初始化")]
+    #[error("{}", tr(Key::TranslateNotInitialized))]
     NotInitialized,
 
-    #[error("模型加载失败：{0}")]
+    #[error("{}", tf(Key::TranslateModelLoadFailed, &[.0.as_str()]))]
     ModelLoad(String),
 
-    #[error("模型目录缺少文件：{0}")]
+    #[error("{}", tf(Key::TranslateModelDirMissing, &[.0.as_str()]))]
     MissingModelFile(String),
 
-    #[error("语言对不支持：{from} → {to}")]
+    #[error("{}", tf(Key::TranslateUnsupportedPair, &[.from.as_str(), .to.as_str()]))]
     UnsupportedPair { from: String, to: String },
 
-    #[error("译文无效（{reason}）：翻译方向可能设置错误")]
+    #[error("{}", tf(Key::TranslatePlatformUnavailable, &[.0.as_str()]))]
+    PlatformUnavailable(String),
+
+    #[error("{}", tf(Key::TranslateInvalidOutput, &[.reason.as_str()]))]
     Degenerate { reason: String },
 
-    #[error("引擎内部错误：{0}")]
+    #[error("{}", tf(Key::TranslateInternal, &[.0.as_str()]))]
     Internal(String),
 }
 
@@ -35,6 +47,53 @@ const REPEAT_RATIO: f32 = 0.6;
 const REPEAT_FLOOR: usize = 4;
 
 const TRAILING_RUN: usize = 4;
+
+pub(crate) const TOKENIZER: &str = "tokenizer.json";
+
+pub(crate) fn load_hf_tokenizer(dir: &Path) -> Result<HfTokenizer, TranslateError> {
+    let mut tokenizer = HfTokenizer::from_file(dir.join(TOKENIZER))
+        .map_err(|e| TranslateError::ModelLoad(format!("{}/{}：{e}", dir.display(), TOKENIZER)))?;
+    tokenizer.disable_spacial_token();
+    Ok(tokenizer)
+}
+
+pub(crate) fn warm_text(source_lang: &str) -> &'static str {
+    match base_lang(source_lang) {
+        "zh" => "你好",
+        "ja" => "こんにちは",
+        "ko" => "안녕하세요",
+        _ => "hello",
+    }
+}
+
+pub(crate) fn apply_zh_script(text: &str, zh_script: Option<ZhScript>) -> String {
+    match zh_script {
+        Some(ZhScript::Simplified) => script::to_simplified(text),
+        Some(ZhScript::Traditional) => script::to_traditional(text),
+        None => text.to_string(),
+    }
+}
+
+pub fn check_model_dir(dir: &Path, files: &[&str]) -> Result<(), TranslateError> {
+    let remedy = tr(Key::TranslateRemedyFetchMt);
+
+    if !dir.is_dir() {
+        return Err(TranslateError::MissingModelFile(tf(
+            Key::TranslatePathMissing,
+            &[&dir.display().to_string(), remedy],
+        )));
+    }
+
+    for f in files {
+        if !dir.join(f).is_file() {
+            return Err(TranslateError::MissingModelFile(tf(
+                Key::TranslateFileMissing,
+                &[&dir.display().to_string(), f, remedy],
+            )));
+        }
+    }
+    Ok(())
+}
 
 pub fn degenerate_translation(text: &str) -> Option<String> {
     let t = text.trim();
@@ -91,6 +150,32 @@ impl TranslateCaps {
         offline: true,
         typical_latency_ms: 300,
     };
+
+    pub const MAC_TRANSLATION: Self = Self {
+        incremental: false,
+        offline: true,
+        typical_latency_ms: 200,
+    };
+
+    pub const LOCAL_MULTILINGUAL: Self = Self {
+        incremental: false,
+        offline: true,
+        typical_latency_ms: 500,
+    };
+
+    pub const LOCAL_LMT_FAST: Self = Self::LOCAL_MULTILINGUAL;
+
+    pub const LOCAL_LMT_HIGH: Self = Self {
+        incremental: false,
+        offline: true,
+        typical_latency_ms: 1500,
+    };
+}
+
+pub(crate) fn mt_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(2, 4))
+        .unwrap_or(2)
 }
 
 pub trait Translator: Send {
@@ -106,6 +191,12 @@ pub trait Translator: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mt_threads_stays_within_bounds() {
+        let n = mt_threads();
+        assert!((2..=4).contains(&n), "MT 线程数越界：{n}");
+    }
 
     #[test]
     fn catches_unk_from_wrong_direction() {

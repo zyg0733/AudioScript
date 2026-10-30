@@ -163,6 +163,7 @@ describe('StoreProvider session and fork capabilities', () => {
       name: 'AudioScript',
       version: '0.2.10',
       platform: 'macos',
+      macSpeechSupported: false,
       arch: 'aarch64',
       builtAtMs: null,
       analyticsAvailable: false,
@@ -402,9 +403,10 @@ describe('StoreProvider session and fork capabilities', () => {
       await toggle
     })
     expect(ipc.sessionStart).toHaveBeenCalledWith(
-      undefined,
+      { device: undefined, mixMicDeviceId: undefined, mixSystemDeviceId: undefined },
       TranslateEngine.LocalNmt,
       'zh',
+      undefined,
       ZhScript.Traditional,
       AudioSourceKind.Loopback,
     )

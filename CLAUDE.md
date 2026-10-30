@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-离线优先的语音转写桌面应用：Tauri v2 + React 19 + TypeScript，Rust 后端，pnpm 管理。
+## 项目要求
 
 ## 常用命令
 
@@ -32,24 +32,37 @@ cd src-tauri && cargo test
 
 ## 约定
 
-- 用户可见文案、日志、错误信息用中文。
+- 用户可见文案走 i18n；日志与测试断言保持中文。
 - 注释只保留功能性警告和约束，不写解释性内容。
 - TS 格式由 Biome 决定：单引号、无分号、2 空格、120 列。`src/shared/types.ts` 由 typeshare 生成，不要手改。
 - Rust 只格式化本次改动的文件；全仓 `cargo fmt` 会带出无关改动。
-- macOS 麦克风 / 系统声音权限只能在打包后的 `.app` 里验证；dev 裸二进制缺 Info.plist，会表现为「假性不工作」。
-- macOS 14.2+ / Windows 10+ / Ubuntu 24 均已实测可用。
 
-## 可维护操作
+## 运行时约束
 
-```bash
-pnpm fetch:model:high   # 下载高精度 ASR（511 MB）到 .cache/，打印 catalog 片段
-pnpm verify:models      # 校验 model-catalog.json（--online 会重新下载核对）
-```
+- 阻塞命令走 `run_lane`（`cmd-quick` / `cmd-session`），不要用 `spawn_blocking`，也不要在 CT2/MKL 初始化后为控制路径新建线程——Windows 加载器锁会让新线程停在 `LdrInitializeThunk`。
+- 所有常驻线程（事件、收尾、翻译、`asr-offline-worker`）在 `setup` 里预创建；`LocalNmt::init` 启动时做一次预热翻译——删掉会在 Windows 上出现「命令到达但线程不执行」。
+- 离线 ASR 解码不得阻塞采集线程；Silero VAD 切句，只出 final。
 
 fork 身份：`zyg0733/AudioScript`，应用标识 `io.github.zyg0733.audioscript`。项目链接集中在根目录 `project.json`；保留原作者与 MIT，不得沿用上游更新公钥或统计 Key。新应用标识使用独立配置目录，旧安装的数据不自动迁移。
 
 自动更新签名：仓库 Actions 变量 `TAURI_UPDATER_PUBLIC_KEY` 保存本项目公钥；Secrets `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 保存本项目私钥及其密码。CI 的 `scripts/configure-release.mjs` 生成 `.cache/tauri-release.conf.json`；tag 发布缺配置立即失败，手动验证缺配置不产出更新工件。普通本地构建未设置公钥时更新明确禁用，禁止回退到上游。不要生成、读取或输出私钥。
 
 统计默认关闭，仅构建环境 `AUDIOSCRIPT_APTABASE_APP_KEY` 非空才加载插件并允许用户主动开启。完整流程见 `docs/FORK_MAINTENANCE.md`。
+## 平台
 
-`fetch:model:high` 仅供维护者启用可选模型，普通开发构建不需要。
+- macOS 26+ 系统语音 / 翻译：Swift 静态库由 `build.rs` 编译，SDK < 26 时跳过；裸二进制没有 Info.plist，麦克风与系统声音权限调用会被 TCC 终止——只能在打包后的 `.app` 里验证，dev 模式「不工作」是预期行为。
+- macOS 系统翻译的目标语言必须从运行时 `LanguageAvailability.supportedLanguages` 读取，不能写死；源语言在 Zipformer / 本地 NMT 下仍限 en/zh；语言包由系统管理，不能静默下载。
+- 新增界面语言要补 `resources/*.lproj/InfoPlist.strings` 并在 `tauri.conf.json` 的 `resources` 注册。
+
+## 数据与文档
+
+- `src-tauri/assets/model-catalog.json`：可选模型必须填 `sha256` / `sizeBytes` 并设 `downloadable: true`，否则 UI 显示「资源尚未发布」；NLLB 许可 CC-BY-NC-4.0，仅限非商业。
+- `docs/SPEC.md` 章节号被代码和测试引用；`docs/index.html` 的版本号、模型清单、平台与语言说明是手写的，改模型 / 发版时同步。
+
+## 发布
+
+- 发布走本 fork 的 CI，使用本 fork 的签名配置；详见 `docs/FORK_MAINTENANCE.md`。
+
+## 环境
+
+- 首次 checkout 后除 `pnpm install`（会拉内置 ASR 模型）外还要 `pnpm fetch:mt`；`fetch:model:high` / `fetch:mt:multi` / `verify:models` 是维护者脚本。

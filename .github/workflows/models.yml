@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: '把大模型归档上传到 models-v1 release'
+        description: '把 NLLB 模型归档上传到 models-v1 release（仅限非商业用途）'
         type: boolean
         default: false
 
@@ -57,11 +57,9 @@ jobs:
           node scripts/fetch-model.mjs --model high --print-catalog | tee asr-high.log
           grep -A6 CATALOG_FRAGMENT asr-high.log
 
-      # 转换 tc-big、打 tar.gz，并输出 SHA-256 / 体积。
-      - name: Build MT big model
-        run: |
-          node scripts/fetch-mt-model.mjs --tier big --print-catalog | tee mt-big.log
-          grep -A6 CATALOG_FRAGMENT mt-big.log
+      # NLLB 使用 CC-BY-NC-4.0，仅允许非商业用途。
+      - name: Build NLLB model
+        run: node scripts/fetch-mt-model.mjs --multilingual
 
       - name: Verify catalog (offline)
         run: node scripts/verify-model-catalog.mjs
@@ -71,7 +69,7 @@ jobs:
         with:
           name: model-assets
           path: |
-            dist/models/models-v1/*.tar.gz
+            .cache/nllb-200-distilled-600M-ct2-int8.tar.gz
           compression-level: 0
 
       - name: Publish to models-v1
@@ -83,4 +81,4 @@ jobs:
           make_latest: false
           fail_on_unmatched_files: true
           files: |
-            dist/models/models-v1/*.tar.gz
+            .cache/nllb-200-distilled-600M-ct2-int8.tar.gz

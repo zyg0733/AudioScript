@@ -1,10 +1,12 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { t } from './i18n'
 import { withTimeout } from './timeout'
 import type {
   AudioStatus,
   EndpointConfig,
   InputDevice,
+  MacSpeechStatus,
   MicRequestResult,
   ModelJobStatus,
   ModelStatus,
@@ -20,6 +22,8 @@ import type {
 } from './types'
 import {
   AudioSourceKind,
+  EngineType,
+  Language,
   MicPermission,
   ModelPhase,
   type OverlayMode,
@@ -32,6 +36,7 @@ import {
 export type {
   AudioStatus,
   InputDevice,
+  MacSpeechStatus,
   ModelJobStatus,
   ModelStatus,
   ModelsList,
@@ -41,7 +46,17 @@ export type {
   PrefsPatch,
   SystemAudioProbe,
 }
-export { AudioSourceKind, MicPermission, ModelPhase, SystemAudioVerdict, Theme, TranslateEngine, ZhScript }
+export {
+  AudioSourceKind,
+  EngineType,
+  Language,
+  MicPermission,
+  ModelPhase,
+  SystemAudioVerdict,
+  Theme,
+  TranslateEngine,
+  ZhScript,
+}
 
 export async function call<T = unknown>(name: string, args: Record<string, unknown> = {}): Promise<T> {
   return invoke<T>('dispatch', { name, args })
@@ -71,8 +86,11 @@ export const EVENT = {
   overlayVisibility: 'overlay://visibility',
   audio: 'transcript://audio',
   level: 'transcript://level',
+  languageMismatch: 'transcript://language-mismatch',
+  deviceLevel: 'transcript://device-level',
   modelsProgress: 'models://progress',
   updateProgress: 'update://progress',
+  locale: 'app://locale',
 } as const
 
 export function on<T>(event: string, handler: (payload: T) => void): Promise<UnlistenFn> {
@@ -84,6 +102,8 @@ export interface AppInfo {
   version: string
   platform: string
   arch: string
+  osVersion?: string | null
+  macSpeechSupported: boolean
   builtAtMs: number | null
   analyticsAvailable: boolean
   analyticsDisabledReason: string | null
@@ -113,6 +133,22 @@ export function appInfo(): Promise<AppInfo> {
   return call<AppInfo>('app_info')
 }
 
+export function macTranslationLanguages(): Promise<string[]> {
+  return call<string[]>('mac_translation_languages')
+}
+
+export function macSpeechStatus(): Promise<MacSpeechStatus> {
+  return call<MacSpeechStatus>('mac_speech_status')
+}
+
+export function macSpeechRequest(): Promise<MacSpeechStatus> {
+  return call<MacSpeechStatus>('mac_speech_request')
+}
+
+export function localeGet(): Promise<string> {
+  return call<string>('locale_get')
+}
+
 export interface UpdateCheckResult {
   currentVersion: string
   enabled: boolean
@@ -139,22 +175,52 @@ export function updateRestart(): Promise<null> {
   return call<null>('update_restart')
 }
 
+export interface SessionDevices {
+  device?: string
+  mixMicDeviceId?: string
+  mixSystemDeviceId?: string
+}
+
 export function sessionStart(
-  device?: string,
+  devices: SessionDevices = {},
   translate: TranslateEngine = TranslateEngine.LocalNmt,
   sourceLang = 'en',
+  targetLang = 'zh',
   zhScript: ZhScript = ZhScript.Simplified,
   source: AudioSourceKind = AudioSourceKind.Loopback,
 ): Promise<TaskStatus> {
   return call<TaskStatus>('session_start', {
-    device: device ?? null,
+    device: devices.device || null,
+    mixMicDeviceId: devices.mixMicDeviceId || null,
+    mixSystemDeviceId: devices.mixSystemDeviceId || null,
     source,
-    config: { translate: { engine: translate, sourceLang, zhScript } },
+    config: { translate: { engine: translate, sourceLang, targetLang, zhScript } },
   })
 }
 
 export function audioDevices(source: AudioSourceKind = AudioSourceKind.Loopback): Promise<InputDevice[]> {
   return call<InputDevice[]>('audio_devices', { source })
+}
+
+export interface DeviceLevelEvent {
+  source: AudioSourceKind
+  device: string | null
+  rms: number
+}
+
+export interface MonitorTarget {
+  source: AudioSourceKind
+  device: string | null
+}
+
+export function monitorStart(targets: MonitorTarget[]): Promise<null> {
+  return call<null>('monitor_start', {
+    targets: targets.map((target) => ({ source: target.source, device: target.device || null })),
+  })
+}
+
+export function monitorStop(): Promise<null> {
+  return call<null>('monitor_stop')
 }
 
 export function prefsGet(): Promise<Preferences> {
@@ -176,7 +242,7 @@ export function configDefaults(): Promise<ConfigDefaults> {
 const MODELS_TIMEOUT_MS = 10_000
 
 export function modelsList(): Promise<ModelsList> {
-  return withTimeout(call<ModelsList>('models_list'), MODELS_TIMEOUT_MS, '读取模型列表超时，请重试')
+  return withTimeout(call<ModelsList>('models_list'), MODELS_TIMEOUT_MS, t('error.modelsTimeout'))
 }
 
 export function modelDownload(modelId: string): Promise<{ jobId: string }> {
@@ -185,6 +251,10 @@ export function modelDownload(modelId: string): Promise<{ jobId: string }> {
 
 export function modelOpenDir(): Promise<null> {
   return call<null>('model_open_dir')
+}
+
+export function modelDirSet(path: string | null): Promise<ModelsList> {
+  return call<ModelsList>('model_dir_set', { path })
 }
 
 export function modelCancel(jobId: string): Promise<{ cancelled: boolean }> {
@@ -209,7 +279,6 @@ export function autostartSet(enabled: boolean): Promise<AutostartState> {
 
 export interface HotkeyInfo {
   id: string
-  label: string
   accelerator: string
   acceleratorPretty: string
   defaultAccelerator: string
@@ -225,13 +294,17 @@ export function shortcutsSet(id: string, accelerator: string): Promise<HotkeyInf
   return call<HotkeyInfo[]>('shortcuts_set', { id, accelerator })
 }
 
-export type PrivacyPane = 'microphone' | 'systemAudio'
+export type SystemSettingsPane = 'microphone' | 'systemAudio' | 'speech' | 'translation'
 
-export function openPrivacySettings(pane: PrivacyPane = 'systemAudio'): Promise<null> {
-  return call<null>('open_privacy_settings', { pane })
+export function openSystemSettings(pane: SystemSettingsPane = 'systemAudio'): Promise<null> {
+  return call<null>('open_system_settings', { pane })
 }
 
-export type PermissionKind = PrivacyPane
+export function openPrivacySettings(pane: 'microphone' | 'systemAudio' = 'systemAudio'): Promise<null> {
+  return openSystemSettings(pane)
+}
+
+export type PermissionKind = Exclude<SystemSettingsPane, 'translation'>
 
 export interface CmdPermissionError {
   kind: 'permission'
@@ -245,8 +318,22 @@ export function permissionOf(e: unknown): CmdPermissionError | null {
   return c.kind === 'permission' && typeof c.message === 'string' ? (c as CmdPermissionError) : null
 }
 
+export interface CmdSettingsError {
+  kind: 'settings'
+  pane: SystemSettingsPane
+  message: string
+}
+
+export function settingsOf(e: unknown): CmdSettingsError | null {
+  if (typeof e !== 'object' || e === null) return null
+  const c = e as Partial<CmdSettingsError>
+  return c.kind === 'settings' && typeof c.pane === 'string' && typeof c.message === 'string'
+    ? (c as CmdSettingsError)
+    : null
+}
+
 export function formatCmdError(e: unknown): string {
-  return permissionOf(e)?.message ?? String(e)
+  return permissionOf(e)?.message ?? settingsOf(e)?.message ?? String(e)
 }
 
 export function permissionStatus(): Promise<PermissionSnapshot> {
@@ -324,7 +411,6 @@ export function sessionClear(): Promise<void> {
 export interface HotkeyFailure {
   id: string
   accelerator: string
-  label: string
 }
 
 export function hotkeyFailures(): Promise<HotkeyFailure[]> {

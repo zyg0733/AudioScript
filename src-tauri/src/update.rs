@@ -2,6 +2,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
 
+use crate::i18n::{tf, tr, Key};
+
 const PROGRESS_EVENT: &str = "update://progress";
 pub const DISABLED_REASON: &str =
     "此构建未配置本项目的更新公钥，自动更新已禁用。请从本项目 Releases 手动下载。";
@@ -55,7 +57,7 @@ pub async fn check(app: &AppHandle) -> Result<UpdateCheck, String> {
     let update = updater
         .check()
         .await
-        .map_err(|e| format!("检查更新失败：{e}"))?;
+        .map_err(|e| tf(Key::UpdateCheckFailed, &[&e.to_string()]))?;
 
     match update {
         Some(update) => {
@@ -100,9 +102,9 @@ pub async fn install(app: &AppHandle) -> Result<String, String> {
     let Some(mut update) = updater
         .check()
         .await
-        .map_err(|e| format!("检查更新失败：{e}"))?
+        .map_err(|e| tf(Key::UpdateCheckFailed, &[&e.to_string()]))?
     else {
-        return Err("已是最新版本，无需更新".into());
+        return Err(tr(Key::UpdateLatest).into());
     };
     update.timeout = Some(std::time::Duration::from_secs(300));
 
@@ -125,7 +127,7 @@ pub async fn install(app: &AppHandle) -> Result<String, String> {
             || {},
         )
         .await
-        .map_err(|e| format!("安装更新失败：{e}"))?;
+        .map_err(|e| tf(Key::UpdateInstallFailed, &[&e.to_string()]))?;
 
     tracing::info!(version = %version, "更新已安装，重启后生效");
     Ok(version)

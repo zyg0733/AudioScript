@@ -1,3 +1,4 @@
+import { useI18n } from '@/shared/i18n'
 import { cn } from './cn'
 import { Icon } from './Icon'
 
@@ -26,6 +27,7 @@ export function Slider({
   disabled,
   label,
 }: Props) {
+  const { t } = useI18n()
   const dirty = defaultValue !== undefined && value !== defaultValue
 
   return (
@@ -43,11 +45,11 @@ export function Slider({
         onKeyUp={onCommit ? (e) => onCommit(Number((e.target as HTMLInputElement).value)) : undefined}
         className="h-1 flex-1 cursor-pointer appearance-none rounded-full bg-[var(--color-surface-2)] accent-[var(--color-accent)] disabled:cursor-not-allowed disabled:opacity-40"
       />
-      <span className="w-16 text-right font-mono text-[var(--color-ink-1)] text-xs">{format(value)}</span>
+      <span className="w-16 text-end font-mono text-[var(--color-ink-1)] text-xs">{format(value)}</span>
       {defaultValue !== undefined && (
         <button
           type="button"
-          aria-label={`${label} 恢复默认`}
+          aria-label={t('common.resetToDefault', { label })}
           disabled={disabled || !dirty}
           onClick={() => {
             onChange(defaultValue)

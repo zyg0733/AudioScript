@@ -1,29 +1,25 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from '@/main/store'
-import { AudioSourceKind, formatCmdError, openPrivacySettings } from '@/shared/ipc'
+import { useI18n } from '@/shared/i18n'
+import {
+  AudioSourceKind,
+  formatCmdError,
+  type InputDevice,
+  type MonitorTarget,
+  monitorStart,
+  monitorStop,
+  openPrivacySettings,
+  permissionOf,
+} from '@/shared/ipc'
 import { isMacOS, isWindows } from '@/shared/platform'
 import { TaskStatus } from '@/shared/types'
 import { Alert } from '@/ui/Alert'
 import { Button } from '@/ui/Button'
 import { ChoiceCard, ChoiceGroup } from '@/ui/ChoiceCard'
-import { LevelMeter } from '@/ui/LevelMeter'
+import { DeviceSelect, describeDevice } from '@/ui/DeviceSelect'
+import { DeviceLevelMeter, LevelMeter } from '@/ui/LevelMeter'
 import { Page } from '@/ui/Page'
-import { Select } from '@/ui/Select'
 import { SectionLabel, SettingsGroup, SettingsRow } from '@/ui/Settings'
-
-const SOURCE_OPTIONS = [
-  {
-    value: AudioSourceKind.Loopback,
-    label: '系统声音',
-    description: '转写播放器输出的声音。',
-  },
-  { value: AudioSourceKind.Mic, label: '麦克风', description: '只转写麦克风输入，不碰播放器。' },
-  {
-    value: AudioSourceKind.Mix,
-    label: '麦克风 + 系统声',
-    description: '两路同时采集：对方的声音和你的都进转写，适合会议。',
-  },
-]
 
 export function AudioPage({ onOpenPermissions }: { onOpenPermissions: () => void }) {
   const {
@@ -32,36 +28,149 @@ export function AudioPage({ onOpenPermissions }: { onOpenPermissions: () => void
     devices,
     device,
     setDevice,
+    mixMicDevices = [],
+    mixSystemDevices = [],
+    mixMicDevice,
+    mixSystemDevice,
+    setMixMicDevice,
+    setMixSystemDevice,
     deviceError,
     refreshDevices,
     audio,
     status,
     pending,
+    prefsReady,
+    devicesLoading,
   } = useStore()
+  const { t } = useI18n()
+
+  const sourceOptions = [
+    {
+      value: AudioSourceKind.Loopback,
+      label: t('audio.sourceLoopbackLabel'),
+      description: t('audio.sourceLoopbackDescription'),
+    },
+    {
+      value: AudioSourceKind.Mic,
+      label: t('audio.sourceMicLabel'),
+      description: t('audio.sourceMicDescription'),
+    },
+    {
+      value: AudioSourceKind.Mix,
+      label: t('audio.sourceMixLabel'),
+      description: t('audio.sourceMixDescription'),
+    },
+  ]
 
   const capturing = status === TaskStatus.Capturing
-  const selected = devices.find((d) => d.id === device)
+  const isMix = audioSource === AudioSourceKind.Mix
+
+  const [previewOn, setPreviewOn] = useState(false)
+  const [openMenu, setOpenMenu] = useState<'single' | 'mic' | 'system' | null>(null)
+  const [monitorError, setMonitorError] = useState<{ message: string; permission: boolean } | null>(null)
+  const previewSeq = useRef(0)
+  const previewing = previewOn && !pending && !capturing
+
+  const targets = useMemo<MonitorTarget[]>(() => {
+    const out: MonitorTarget[] = []
+    if (isMix) {
+      out.push({ source: AudioSourceKind.Mic, device: mixMicDevice })
+      out.push({ source: AudioSourceKind.Loopback, device: mixSystemDevice })
+      if (openMenu === 'mic') {
+        for (const d of mixMicDevices) out.push({ source: AudioSourceKind.Mic, device: d.id })
+      }
+      if (openMenu === 'system') {
+        for (const d of mixSystemDevices) out.push({ source: AudioSourceKind.Loopback, device: d.id })
+      }
+      return out
+    }
+    if (openMenu === 'single') {
+      for (const d of devices) out.push({ source: audioSource, device: d.id })
+      if (!device) out.push({ source: audioSource, device: null })
+      if (out.length === 0) out.push({ source: audioSource, device: null })
+      return out
+    }
+    out.push({ source: audioSource, device })
+    return out
+  }, [isMix, mixMicDevice, mixSystemDevice, openMenu, mixMicDevices, mixSystemDevices, devices, device, audioSource])
+
+  const startPreview = useCallback(() => {
+    if (!prefsReady || devicesLoading || capturing) return
+    const seq = ++previewSeq.current
+    monitorStart(targets)
+      .then(() => {
+        if (seq !== previewSeq.current) return
+        setPreviewOn(true)
+        setMonitorError(null)
+      })
+      .catch((e) => {
+        if (seq !== previewSeq.current) return
+        setPreviewOn(false)
+        setMonitorError({ message: formatCmdError(e), permission: permissionOf(e) !== null })
+      })
+  }, [prefsReady, devicesLoading, capturing, targets])
+
+  useEffect(() => {
+    if (capturing) {
+      setPreviewOn(false)
+      setMonitorError(null)
+      return
+    }
+    if (!prefsReady || devicesLoading) return
+    const timer = window.setTimeout(() => void startPreview(), 200)
+    return () => window.clearTimeout(timer)
+  }, [startPreview, capturing, prefsReady, devicesLoading])
+
+  useEffect(() => {
+    const onFocus = () => void startPreview()
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [startPreview])
+
+  useEffect(() => {
+    return () => {
+      previewSeq.current += 1
+      monitorStop().catch(() => {})
+    }
+  }, [])
 
   return (
-    <Page title="音频">
+    <Page title={t('audio.title')}>
       {deviceError && (
-        <Alert tone="warn" title="无法枚举音频设备">
-          <p className="font-mono text-[0.95em]">{deviceError}</p>
-          <p className="mt-1">仍可使用「系统默认」设备，仅手动指定设备受影响。</p>
-          <p className="mt-1">
-            {isMacOS ? (
-              <>
-                麦克风授权未决时，macOS 可能无法列出设备，请先确认权限。
-                <Button size="sm" className="ml-1.5" onClick={onOpenPermissions}>
-                  查看权限
+        <Alert
+          tone="warn"
+          title={t('audio.enumerateFailed')}
+          actions={
+            <Button size="sm" onClick={onOpenPermissions}>
+              {t('audio.viewPermissions')}
+            </Button>
+          }
+        >
+          <p className="break-words font-mono text-[0.95em]">{deviceError}</p>
+          <p className="mt-1">{t('audio.enumerateHintDefault')}</p>
+          {isMacOS && <p className="mt-1">{t('audio.enumerateHintPermission')}</p>}
+        </Alert>
+      )}
+
+      {monitorError && (
+        <Alert
+          tone="warn"
+          title={t('audio.previewFailed')}
+          onDismiss={() => setMonitorError(null)}
+          actions={
+            <>
+              {monitorError.permission && (
+                <Button size="sm" onClick={onOpenPermissions}>
+                  {t('audio.viewPermissions')}
                 </Button>
-              </>
-            ) : isWindows ? (
-              '请检查 Windows 的音频设备设置与设备连接，再点击「刷新」。'
-            ) : (
-              '请检查系统音频服务与设备连接，再点击「刷新」。'
-            )}
-          </p>
+              )}
+              <Button size="sm" variant="ghost" onClick={() => void startPreview()}>
+                {t('common.retry')}
+              </Button>
+            </>
+          }
+        >
+          <p className="break-words font-mono text-[0.95em]">{monitorError.message}</p>
         </Alert>
       )}
 
@@ -70,9 +179,9 @@ export function AudioPage({ onOpenPermissions }: { onOpenPermissions: () => void
       )}
 
       <section className="space-y-2">
-        <SectionLabel>音源</SectionLabel>
-        <ChoiceGroup label="音源">
-          {SOURCE_OPTIONS.map((o) => (
+        <SectionLabel>{t('audio.sourceSection')}</SectionLabel>
+        <ChoiceGroup label={t('audio.sourceSection')}>
+          {sourceOptions.map((o) => (
             <ChoiceCard
               key={o.value}
               title={o.label}
@@ -87,46 +196,121 @@ export function AudioPage({ onOpenPermissions }: { onOpenPermissions: () => void
             />
           ))}
         </ChoiceGroup>
-        <p className="px-1 text-[var(--color-ink-2)] text-[0.7rem] leading-relaxed">更换音源后设备列表将重新枚举。</p>
+        <p className="px-1 text-[var(--color-ink-2)] text-[0.7rem] leading-relaxed">{t('audio.sourceHint')}</p>
       </section>
 
-      <SettingsGroup title="输入设备">
-        <SettingsRow
-          icon="waveform"
-          title="输入设备"
-          description={
-            selected
-              ? `${selected.channels} 声道 · ${selected.sampleRate} Hz${selected.isDefault ? ' · 系统默认' : ''}`
-              : undefined
-          }
-          control={
-            <div className="flex items-center gap-1.5">
-              <LevelMeter active={capturing} />
-              <Select
-                label="输入设备"
-                value={device}
-                options={
-                  devices.length === 0
-                    ? [{ value: '', label: '（未找到设备）' }]
-                    : devices.map((d) => ({
-                        value: d.id,
-                        label: d.name,
-                      }))
-                }
-                onChange={setDevice}
-                disabled={capturing || pending}
-                className="max-w-[13rem]"
-              />
-              <Button icon="refresh" size="sm" onClick={() => void refreshDevices()}>
-                刷新
-              </Button>
-            </div>
-          }
-        />
+      <SettingsGroup title={t('audio.inputDevice')}>
+        {isMix ? (
+          <>
+            <DeviceRow
+              icon="waveform"
+              title={t('permissions.mic')}
+              label={t('audio.micDevice')}
+              devices={mixMicDevices}
+              value={mixMicDevice}
+              source={AudioSourceKind.Mic}
+              capturing={capturing}
+              previewing={previewing}
+              onChange={setMixMicDevice}
+              onOpenChange={(open) => setOpenMenu(open ? 'mic' : null)}
+              onRefresh={() => void refreshDevices()}
+            />
+            <DeviceRow
+              icon="speaker"
+              title={t('audio.sourceLoopbackLabel')}
+              label={t('audio.systemDevice')}
+              devices={mixSystemDevices}
+              value={mixSystemDevice}
+              source={AudioSourceKind.Loopback}
+              capturing={capturing}
+              previewing={previewing}
+              onChange={setMixSystemDevice}
+              onOpenChange={(open) => setOpenMenu(open ? 'system' : null)}
+              onRefresh={() => void refreshDevices()}
+            />
+          </>
+        ) : (
+          <DeviceRow
+            icon="waveform"
+            title={t('audio.inputDevice')}
+            label={t('audio.inputDevice')}
+            devices={devices}
+            value={device}
+            source={audioSource}
+            capturing={capturing}
+            previewing={previewing}
+            onChange={setDevice}
+            onOpenChange={(open) => setOpenMenu(open ? 'single' : null)}
+            onRefresh={() => void refreshDevices()}
+          />
+        )}
       </SettingsGroup>
 
-      {capturing && <p className="text-[var(--color-ink-2)] text-[0.7rem]">请先停止转写，再更换音源或输入设备。</p>}
+      {capturing && <p className="text-[var(--color-ink-2)] text-[0.7rem]">{t('audio.captureHint')}</p>}
     </Page>
+  )
+}
+
+function DeviceRow({
+  icon,
+  title,
+  label,
+  devices,
+  value,
+  source,
+  capturing,
+  previewing,
+  onChange,
+  onOpenChange,
+  onRefresh,
+}: {
+  icon: 'waveform' | 'speaker'
+  title: string
+  label: string
+  devices: InputDevice[]
+  value: string
+  source: AudioSourceKind
+  capturing: boolean
+  previewing: boolean
+  onChange: (id: string) => void
+  onOpenChange: (open: boolean) => void
+  onRefresh: () => void
+}) {
+  const { t } = useI18n()
+  const selected = devices.find((d) => d.id === value)
+  const description = selected ? describeDevice(selected, t) : undefined
+
+  return (
+    <SettingsRow
+      icon={icon}
+      title={title}
+      description={description}
+      control={
+        <div className="flex items-center gap-1.5">
+          <DeviceSelect
+            label={label}
+            devices={devices}
+            value={value}
+            source={source}
+            meter={
+              capturing ? (
+                <LevelMeter active />
+              ) : (
+                <DeviceLevelMeter device={value || null} source={source} active={previewing} />
+              )
+            }
+            streaming={previewing}
+            onChange={onChange}
+            onOpenChange={onOpenChange}
+            disabled={capturing}
+            className="w-[15rem]"
+          />
+          <Button icon="refresh" size="sm" onClick={onRefresh}>
+            {t('common.refresh')}
+          </Button>
+        </div>
+      }
+    />
   )
 }
 

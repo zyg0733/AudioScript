@@ -13,6 +13,7 @@ use super::state::ModelState;
 use super::status::{ModelJobStatus, ModelPhase};
 use super::{ModelError, ModelKind, EVENT_MODEL_PROGRESS};
 use crate::config::{AsrModelTier, MtModelTier};
+use crate::i18n::{tf, tr, Key};
 use crate::paths;
 
 const STAGING: &str = ".staging";
@@ -29,11 +30,11 @@ pub fn start_download(app: &AppHandle, model_id: &str) -> Result<String, ModelEr
     let archive = entry
         .archive
         .as_ref()
-        .ok_or_else(|| ModelError::Internal(format!("{} 没有下载信息", entry.id)))?;
+        .ok_or_else(|| ModelError::Internal(tf(Key::ModelNoDownloadInfo, &[&entry.id])))?;
     if archive.sha256.len() != 64 || archive.size_bytes == 0 {
-        return Err(ModelError::Internal(format!(
-            "{} 的下载校验信息尚未配置",
-            entry.id
+        return Err(ModelError::Internal(tf(
+            Key::ModelNoChecksumInfo,
+            &[&entry.id],
         )));
     }
     if is_installed_complete(app, entry) {
@@ -98,7 +99,7 @@ pub fn start_download(app: &AppHandle, model_id: &str) -> Result<String, ModelEr
                         &app_for_thread,
                         &status,
                         ModelPhase::Failed,
-                        Some("安装线程异常退出".into()),
+                        Some(tr(Key::ModelThreadPanicked).into()),
                     )
                 }
             }
@@ -118,7 +119,10 @@ pub fn start_download(app: &AppHandle, model_id: &str) -> Result<String, ModelEr
 
     if let Err(e) = spawned {
         app.state::<ModelState>().clear(&job_id);
-        return Err(ModelError::Internal(format!("启动安装线程失败：{e}")));
+        return Err(ModelError::Internal(tf(
+            Key::ModelThreadStartFailed,
+            &[&e.to_string()],
+        )));
     }
 
     tracing::info!(model = model_id, job = %job_id, "模型下载已开始");
@@ -141,9 +145,8 @@ fn is_installed_complete(app: &AppHandle, entry: &CatalogEntry) -> bool {
             .and_then(|resolved| paths::missing_asr_files(&resolved.path, entry).ok())
             .map(|missing| missing.is_empty())
             .unwrap_or(false),
-        ModelKind::Mt => MtModelTier::parse(&entry.tier)
-            .and_then(|tier| paths::locate_mt_root(&roots, tier).ok())
-            .and_then(|resolved| paths::missing_mt_files(&resolved.path, entry).ok())
+        ModelKind::Mt => paths::locate_mt_root(&roots, entry)
+            .and_then(|resolved| paths::missing_mt_files(&resolved.path, entry))
             .map(|missing| missing.is_empty())
             .unwrap_or(false),
     }
@@ -168,7 +171,7 @@ fn run_install(
     let archive = entry
         .archive
         .as_ref()
-        .ok_or_else(|| ModelError::Internal(format!("{} 没有下载信息", entry.id)))?;
+        .ok_or_else(|| ModelError::Internal(tf(Key::ModelNoDownloadInfo, &[&entry.id])))?;
 
     let user_root = paths::ensure_user_models_root(app).map_err(ModelError::Internal)?;
     let downloads = user_root.join(DOWNLOADS);
@@ -231,9 +234,9 @@ fn run_install(
     let old = trash_root.join(format!("{job_id}-old"));
     let moved_old = if final_dir.exists() {
         std::fs::rename(&final_dir, &old).map_err(|e| {
-            ModelError::Io(format!(
-                "无法替换已存在的模型目录（可能文件被占用）：{}：{e}",
-                final_dir.display()
+            ModelError::Io(tf(
+                Key::ModelReplaceFailed,
+                &[&final_dir.display().to_string(), &e.to_string()],
             ))
         })?;
         true
@@ -246,9 +249,9 @@ fn run_install(
             std::fs::rename(&old, &final_dir).ok();
         }
         discard_staging(&part, &staging_root);
-        return Err(ModelError::Io(format!(
-            "安装模型失败（可能文件被占用）：{}：{e}",
-            final_dir.display()
+        return Err(ModelError::Io(tf(
+            Key::ModelInstallFailed,
+            &[&final_dir.display().to_string(), &e.to_string()],
         )));
     }
 
@@ -324,27 +327,30 @@ pub fn remove_model(app: &AppHandle, model_id: &str) -> Result<(), ModelError> {
         .reserve_processing()
         .map_err(|_| ModelError::InUse)?;
 
-    let root = paths::user_models_root(app)
-        .ok_or_else(|| ModelError::Internal("无法解析应用数据目录".into()))?;
-    let dir = root.join(entry.installed_dir());
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
-        tracing::info!(model = %entry.id, dir = %dir.display(), "模型已删除");
+    let roots = paths::user_models_roots(app);
+    if roots.is_empty() {
+        return Err(ModelError::Internal(tr(Key::ModelNoDataDir).into()));
+    }
+    for root in roots {
+        let dir = root.join(entry.installed_dir());
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+            tracing::info!(model = %entry.id, dir = %dir.display(), "模型已删除");
+        }
     }
 
     Ok(())
 }
 
 pub fn cleanup_stale(app: &AppHandle) {
-    let Some(root) = paths::user_models_root(app) else {
-        return;
-    };
-    for name in [DOWNLOADS, STAGING, TRASH] {
-        let dir = root.join(name);
-        if dir.exists() {
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => tracing::debug!(path = %dir.display(), "已清理模型临时目录"),
-                Err(e) => tracing::warn!(path = %dir.display(), "清理模型临时目录失败：{e}"),
+    for root in paths::user_models_roots(app) {
+        for name in [DOWNLOADS, STAGING, TRASH] {
+            let dir = root.join(name);
+            if dir.exists() {
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => tracing::debug!(path = %dir.display(), "已清理模型临时目录"),
+                    Err(e) => tracing::warn!(path = %dir.display(), "清理模型临时目录失败：{e}"),
+                }
             }
         }
     }
@@ -365,7 +371,7 @@ mod tests {
             "{missing:?}"
         );
 
-        let mt = catalog::entry("mt-big").unwrap();
+        let mt = catalog::entry("mt-base").unwrap();
         let missing = missing_files(&dir, mt).unwrap();
         assert!(
             missing.iter().any(|m| m.contains("model.bin")),

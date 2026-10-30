@@ -202,6 +202,11 @@ export interface LibraryRecord {
 	segments: LibrarySegment[];
 }
 
+export interface MacSpeechStatus {
+	authorization: string;
+	installedLocales: string[];
+}
+
 export enum MicPermission {
 	Granted = "granted",
 	Denied = "denied",
@@ -260,6 +265,9 @@ export interface ModelStatus {
 	installed: boolean;
 	complete: boolean;
 	selected: boolean;
+	multilingual: boolean;
+	languages: string[];
+	streaming: boolean;
 	path?: string;
 	via?: string;
 	installedBytes: number;
@@ -274,6 +282,7 @@ export interface ModelsList {
 	mt: ModelStatus[];
 	job?: ModelJobStatus;
 	userRoot?: string;
+	userRootCustom: boolean;
 }
 
 export enum OverlayMode {
@@ -291,6 +300,8 @@ export interface OverlayConfig {
 	bgColor: string;
 	maxLines: number;
 	glow: boolean;
+	glowSpeed: number;
+	glowWidth: number;
 }
 
 export interface PermissionSnapshot {
@@ -301,6 +312,7 @@ export interface PermissionSnapshot {
 export enum TranslateEngine {
 	Off = "off",
 	LocalNmt = "local-nmt",
+	MacTranslation = "mac-translation",
 	RemoteApi = "remote-api",
 	Mock = "mock",
 }
@@ -314,6 +326,23 @@ export enum Theme {
 	System = "system",
 	Light = "light",
 	Dark = "dark",
+}
+
+export enum Language {
+	System = "system",
+	ZhCn = "zh-CN",
+	ZhTw = "zh-TW",
+	En = "en",
+	Ja = "ja",
+	Ko = "ko",
+	Fr = "fr",
+	De = "de",
+	Es = "es",
+	PtBr = "pt-BR",
+	Ru = "ru",
+	It = "it",
+	Id = "id",
+	Ar = "ar",
 }
 
 export interface WindowPos {
@@ -334,21 +363,31 @@ export interface WindowGeometry {
 export enum AsrModelTier {
 	Builtin = "builtin",
 	HighAccuracy = "high-accuracy",
+	XAsr = "x-asr",
+	Nemotron = "nemotron",
+	Qwen3 = "qwen3",
 }
 
 export enum MtModelTier {
 	Base = "base",
-	Big = "big",
+	Multilingual = "multilingual",
+	LmtFast = "lmt-fast",
+	LmtHigh = "lmt-high",
 }
 
 export interface Preferences {
 	audioSource: string;
 	deviceId?: string;
+	mixMicDeviceId?: string;
+	mixSystemDeviceId?: string;
 	translateEngine: TranslateEngine;
+	asrEngine: EngineType;
 	sourceLang: string;
+	targetLang: string;
 	zhScript: ZhScript;
 	overlay: OverlayConfig;
 	theme: Theme;
+	language: Language;
 	sidebarVisible: boolean;
 	shortcuts: Record<string, string>;
 	endpoint: EndpointConfig;
@@ -356,21 +395,26 @@ export interface Preferences {
 	onboardingDone: boolean;
 	asrModelTier: AsrModelTier;
 	mtModelTier: MtModelTier;
+	modelsDir?: string;
 	analyticsEnabled: boolean;
 }
 
 export interface PrefsPatch {
 	audioSource?: string;
 	deviceId?: string;
+	mixMicDeviceId?: string;
+	mixSystemDeviceId?: string;
 	translateEngine?: TranslateEngine;
+	asrEngine?: EngineType;
 	sourceLang?: string;
+	targetLang?: string;
 	zhScript?: ZhScript;
 	endpoint?: EndpointConfig;
 	theme?: Theme;
+	language?: Language;
 	sidebarVisible?: boolean;
 	onboardingDone?: boolean;
 	asrModelTier?: AsrModelTier;
-	mtModelTier?: MtModelTier;
 	analyticsEnabled?: boolean;
 }
 
@@ -388,6 +432,7 @@ export interface TranslateConfig {
 	targetLang: string;
 	zhScript: ZhScript;
 	modelDir?: string;
+	mtModelTier: MtModelTier;
 }
 
 export interface SessionConfig {
@@ -476,6 +521,9 @@ export enum EndpointProfile {
 export const MIN_FONT_SIZE: number = 10;
 export const MAX_FONT_SIZE: number = 48;
 export const MAX_OVERLAY_LINES: number = 20;
+export const MAX_GLOW_SPEED: number = 100;
+export const MIN_GLOW_WIDTH: number = 1;
+export const MAX_GLOW_WIDTH: number = 8;
 export const MIN_TRAILING_SILENCE_MS: number = 200;
 export const MAX_TRAILING_SILENCE_MS: number = 2000;
 export const MIN_MAX_UTTERANCE_MS: number = 2000;

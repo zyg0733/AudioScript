@@ -141,7 +141,7 @@ fn smoke_asr(model_dir: &Path, pcm: &[f32], expect_speech: bool) -> Result<Durat
         ),
         ..Default::default()
     };
-    let mut engine = StreamingAdapter::new();
+    let mut engine = StreamingAdapter::new(catalog::asr_entry(AsrModelTier::Builtin));
     let init_started = Instant::now();
     let initialized = engine.init(&cfg);
     let init_elapsed = init_started.elapsed();
@@ -238,7 +238,7 @@ fn smoke_translation(
     asr_init: Duration,
 ) -> Result<()> {
     let started = Instant::now();
-    let mut translator = LocalNmt::new(model_dir.to_path_buf(), MtModelTier::Base);
+    let mut translator = LocalNmt::new(model_dir.to_path_buf());
     let cfg = TranslateConfig {
         source_lang: from.to_owned(),
         target_lang: to.to_owned(),

@@ -1,4 +1,4 @@
-import { act } from 'react'
+import { act, useState } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MicPermission, type SystemAudioProbe, SystemAudioVerdict, TaskStatus } from '@/shared/types'
@@ -25,12 +25,21 @@ vi.mock('@/shared/platform', () => ({
 }))
 
 vi.mock('@/main/store', () => ({
-  useStore: () => ({
-    permissions: { microphone: mocks.mic, microphonePromptable: mocks.promptable },
-    refreshPermission: mocks.refreshPermission,
-    refreshDevices: mocks.refreshDevices,
-    status: TaskStatus.Ready,
-  }),
+  useStore: () => {
+    const [systemAudioProbe, setProbe] = useState<SystemAudioProbe | null>(null)
+    return {
+      systemAudioProbe,
+      runSystemAudioProbe: async () => {
+        const result = await mocks.probeSystemAudio()
+        setProbe(result)
+        return result
+      },
+      permissions: { microphone: mocks.mic, microphonePromptable: mocks.promptable },
+      refreshPermission: mocks.refreshPermission,
+      refreshDevices: mocks.refreshDevices,
+      status: TaskStatus.Ready,
+    }
+  },
 }))
 
 vi.mock('@/shared/ipc', async () => ({

@@ -2,6 +2,7 @@ import { save } from '@tauri-apps/plugin-dialog'
 import { useRef, useState } from 'react'
 import { LivePersistenceControls } from '@/main/LivePersistenceControls'
 import { useStore } from '@/main/store'
+import { useI18n } from '@/shared/i18n'
 import { formatCmdError, retryTranslations, revealPath, transcriptExport } from '@/shared/ipc'
 import { TaskStatus } from '@/shared/types'
 import { useTranscriptStream } from '@/shared/useTranscriptStream'
@@ -18,6 +19,7 @@ function exportStamp(d = new Date()): string {
 export function TranscribePage({ onOpenLibrary }: { onOpenLibrary?: (id: string) => void } = {}) {
   const { segments, clear, error: streamError, reconnect, reconnecting } = useTranscriptStream()
   const { status, sessionInfo, clearAll, setError, refreshSession } = useStore()
+  const { t } = useI18n()
   const [pending, setPending] = useState<'clear' | 'export' | 'reveal' | 'retry' | null>(null)
   const pendingRef = useRef(false)
   const [savedExport, setSavedExport] = useState<{ path: string; revealError: string | null } | null>(null)
@@ -66,7 +68,7 @@ export function TranscribePage({ onOpenLibrary }: { onOpenLibrary?: (id: string)
     try {
       const stamp = exportStamp()
       const path = await save({
-        defaultPath: `AudioScript-转写-${stamp.replace(/:/g, '-')}.md`,
+        defaultPath: t('transcribe.exportFileName', { stamp: stamp.replace(/:/g, '-') }),
         filters: [{ name: 'Markdown', extensions: ['md'] }],
       })
       if (!path) return

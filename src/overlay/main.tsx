@@ -1,9 +1,12 @@
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { StrictMode, useEffect, useState } from 'react'
+import { StrictMode, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import '@/shared/theme.css'
-import { EVENT, on, overlayConfigGet } from '@/shared/ipc'
-import { type OverlayConfig, OverlayMode } from '@/shared/types'
+import { useI18n } from '@/shared/i18n'
+import { EVENT, overlayConfigGet, sessionStatus } from '@/shared/ipc'
+import { initLocale } from '@/shared/locale'
+import { type OverlayConfig, OverlayMode, TaskStatus } from '@/shared/types'
+import { useBroadcastSnapshot } from '@/shared/useBroadcastSnapshot'
 import { useTranscriptStream } from '@/shared/useTranscriptStream'
 import { StreamView } from './StreamView'
 
@@ -16,37 +19,31 @@ const DEFAULT_CONFIG: OverlayConfig = {
   fontColor: '#ffffff',
   bgColor: '#101018',
   maxLines: 6,
-  glow: true,
+  glow: false,
+  glowSpeed: 0,
+  glowWidth: 2,
+}
+
+void initLocale()
+
+function useCapturing(): boolean {
+  const [capturing, setCapturing] = useState(false)
+
+  useBroadcastSnapshot<TaskStatus>(
+    EVENT.taskState,
+    () => sessionStatus().then((info) => info.status),
+    (status) => setCapturing(status === TaskStatus.Capturing),
+  )
+
+  return capturing
 }
 
 function OverlayApp() {
   const { segments, error, reconnect, reconnecting } = useTranscriptStream()
+  const capturing = useCapturing()
   const [config, setConfig] = useState<OverlayConfig>(DEFAULT_CONFIG)
 
-  useEffect(() => {
-    const unlisten: Array<() => void> = []
-    let disposed = false
-
-    let gotBroadcast = false
-    on<OverlayConfig>(EVENT.overlayState, (c) => {
-      gotBroadcast = true
-      setConfig(c)
-    }).then((fn) => {
-      if (disposed) fn()
-      else unlisten.push(fn)
-    })
-
-    overlayConfigGet()
-      .then((c) => {
-        if (!disposed && !gotBroadcast) setConfig(c)
-      })
-      .catch(() => {})
-
-    return () => {
-      disposed = true
-      for (const fn of unlisten) fn()
-    }
-  }, [])
+  useBroadcastSnapshot<OverlayConfig>(EVENT.overlayState, overlayConfigGet, setConfig)
 
   return (
     <div className="fixed inset-0">
@@ -61,6 +58,9 @@ function OverlayApp() {
         error={error}
         onReconnect={reconnect}
         reconnecting={reconnecting}
+        glowSpeed={config.glowSpeed}
+        glowWidth={config.glowWidth}
+        streaming={capturing}
       />
       {config.mode === OverlayMode.Edit && <EditChrome />}
     </div>
@@ -68,6 +68,7 @@ function OverlayApp() {
 }
 
 function EditChrome() {
+  const { t } = useI18n()
   const win = getCurrentWindow()
 
   const drag = (e: React.MouseEvent) => {
@@ -79,7 +80,8 @@ function EditChrome() {
   const resize = (e: React.MouseEvent) => {
     if (e.button !== 0) return
     e.preventDefault()
-    win.startResizeDragging('SouthEast').catch((err) => console.error('缩放悬浮窗失败', err))
+    const direction = document.documentElement.dir === 'rtl' ? 'SouthWest' : 'SouthEast'
+    win.startResizeDragging(direction).catch((err) => console.error('缩放悬浮窗失败', err))
   }
 
   return (
@@ -88,7 +90,7 @@ function EditChrome() {
 
       <button
         type="button"
-        aria-label="移动悬浮窗"
+        aria-label={t('overlayWindow.move')}
         onMouseDown={drag}
         className="absolute inset-x-0 top-0 z-10 flex h-4 cursor-move items-center justify-center border-0 bg-transparent p-0"
       >
@@ -97,11 +99,11 @@ function EditChrome() {
 
       <button
         type="button"
-        aria-label="调整悬浮窗大小"
+        aria-label={t('overlayWindow.resize')}
         onMouseDown={resize}
-        className="absolute right-0 bottom-0 z-10 size-5 cursor-nwse-resize border-0 bg-transparent p-0"
+        className="absolute end-0 bottom-0 z-10 size-5 cursor-nwse-resize border-0 bg-transparent p-0"
       >
-        <span className="absolute right-1 bottom-1 h-2.5 w-2.5 border-[var(--color-accent)] border-r-2 border-b-2 opacity-70" />
+        <span className="absolute end-1 bottom-1 h-2.5 w-2.5 border-[var(--color-accent)] border-e-2 border-b-2 opacity-70" />
       </button>
     </>
   )

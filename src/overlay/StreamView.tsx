@@ -1,7 +1,8 @@
-import { type CSSProperties, memo, useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import { copyText, formatSegmentText } from '@/shared/clipboard'
 import { OverlayMode, SegmentState, type TranscriptSegment, TranslationState } from '@/shared/types'
 import { useTranscriptWindow } from '@/shared/useTranscriptWindow'
+import { FlowingBorder } from './FlowingBorder'
 
 const SOURCE_SCALE = 0.8
 
@@ -16,6 +17,9 @@ interface Props {
   opacity: number
   bgColor: string
   glow: boolean
+  glowSpeed?: number
+  glowWidth?: number
+  streaming?: boolean
   mode: OverlayMode
   error?: string | null
   onReconnect?: () => void
@@ -29,6 +33,9 @@ export function StreamView({
   opacity,
   bgColor,
   glow,
+  glowSpeed = 1,
+  glowWidth = 3,
+  streaming = false,
   mode,
   error,
   onReconnect,
@@ -159,13 +166,7 @@ export function StreamView({
         </div>
       )}
 
-      {glow && (
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-0 rounded-[var(--radius-panel)]"
-          style={rainbowRing(3)}
-        />
-      )}
+      {glow && <FlowingBorder streaming={streaming} speed={glowSpeed} width={glowWidth} />}
     </div>
   )
 }
@@ -173,22 +174,6 @@ export function StreamView({
 function latestFinalSegment(segments: TranscriptSegment[]): TranscriptSegment | undefined {
   for (let index = segments.length - 1; index >= 0; index -= 1) {
     if (segments[index].state !== SegmentState.Partial) return segments[index]
-  }
-}
-
-const RAINBOW_GRADIENT = 'linear-gradient(90deg, #b06ab3 0%, #4facfe 25%, #47cf73 50%, #ffc371 75%, #ff5f6d 100%)'
-
-function rainbowRing(padding: number): CSSProperties {
-  const maskImage = 'linear-gradient(#000 0 0), linear-gradient(#000 0 0)'
-  return {
-    background: RAINBOW_GRADIENT,
-    padding,
-    maskImage,
-    maskClip: 'content-box, border-box',
-    maskComposite: 'exclude',
-    WebkitMaskImage: maskImage,
-    WebkitMaskClip: 'content-box, border-box',
-    WebkitMaskComposite: 'xor',
   }
 }
 
