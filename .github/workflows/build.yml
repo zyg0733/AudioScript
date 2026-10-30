@@ -69,7 +69,7 @@ jobs:
   build-mac-arm:
     needs: release-config
     name: Build (macOS ARM)
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 60
 
     steps:
@@ -79,7 +79,7 @@ jobs:
       - name: Assert arm64 runner
         run: |-
           test "$(uname -m)" = arm64 ||
-            { echo "::error::runner 不是 arm64——产物会是 x86_64 却被当成 ARM 发出去，需改用 macos-14 并显式 --target"; exit 1; }
+            { echo "::error::runner 不是 arm64，不能构建 macOS ARM 安装包"; exit 1; }
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
